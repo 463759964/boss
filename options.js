@@ -1,5 +1,5 @@
-// ============================================================
-// Options Page JS - 高级设置页面逻辑
+﻿// ============================================================
+// Options Page JS - 楂樼骇璁剧疆椤甸潰閫昏緫
 // ============================================================
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -7,10 +7,10 @@ document.addEventListener('DOMContentLoaded', () => {
   bindEvents();
 });
 
-const OPTIONS_KEYS = {
-  keywords: 'boss_autoapplier_keywords',
-  filters: 'boss_autoapplier_filters',
-  delivery: 'boss_autoapplier_delivery'
+const STORAGE_KEYS = {
+  keywords: 'ba_keywords',
+  filters: 'ba_filters',
+  delivery: 'ba_delivery'
 };
 
 // DOM refs
@@ -43,29 +43,27 @@ let allKeywords = [];
 let currentFilters = {};
 let currentDelivery = {};
 
-// ===== 加载所有设置 =====
+// ===== 鍔犺浇鎵€鏈夎缃?=====
 async function loadAllSettings() {
   const result = await chrome.storage.local.get([
-    OPTIONS_KEYS.keywords,
-    OPTIONS_KEYS.filters,
-    OPTIONS_KEYS.delivery
+    STORAGE_KEYS.keywords,
+    STORAGE_KEYS.filters,
+    STORAGE_KEYS.delivery
   ]);
 
-  allKeywords = result[OPTIONS_KEYS.keywords] || [];
-  currentFilters = result[OPTIONS_KEYS.filters] || {};
-  currentDelivery = result[OPTIONS_KEYS.delivery] || {};
+  allKeywords = result[STORAGE_KEYS.keywords] || [];
+  currentFilters = result[STORAGE_KEYS.filters] || {};
+  currentDelivery = result[STORAGE_KEYS.delivery] || {};
 
-  // 渲染关键字列表
-  renderOptionKeywords();
+  // 娓叉煋鍏抽敭瀛楀垪琛?  renderOptionKeywords();
 
-  // 填充基础字段
+  // 濉厖鍩虹瀛楁
   el.areas.value = (currentFilters.area || []).join(', ');
   el.salaryMin.value = currentFilters.salaryMin || '';
   el.salaryMax.value = currentFilters.salaryMax || '';
   el.industries.value = (currentFilters.industry || []).join(', ');
 
-  // 投递设置
-  el.maxDaily.value = currentDelivery.maxDailyCount ?? 50;
+  // 鎶曢€掕缃?  el.maxDaily.value = currentDelivery.maxDailyCount ?? 50;
   el.intervalMin.value = currentDelivery.intervalMin ?? 10;
   el.intervalMax.value = currentDelivery.intervalMax ?? 30;
   el.batchSize.value = currentDelivery.batchSize ?? 5;
@@ -73,16 +71,15 @@ async function loadAllSettings() {
   el.safeMode.checked = currentDelivery.safeModeEnabled !== false;
   el.greeting.value = currentDelivery.customGreeting || '';
 
-  // 渲染复选框组
-  renderOptionCheckboxes('experience', ['不限','应届经验','1-3年','3-5年','5-10年','10年以上'], currentFilters.experience || []);
-  renderOptionCheckboxes('education', ['不限','初中及以下','中专/中技','高中','大专','本科','硕士','博士'], currentFilters.education || []);
+  // 娓叉煋澶嶉€夋缁?  renderOptionCheckboxes('experience', ['涓嶉檺','搴斿眾缁忛獙','1-3骞?,'3-5骞?,'5-10骞?,'10骞翠互涓?], currentFilters.experience || []);
+  renderOptionCheckboxes('education', ['涓嶉檺','鍒濅腑鍙婁互涓?,'涓笓/涓妧','楂樹腑','澶т笓','鏈','纭曞＋','鍗氬＋'], currentFilters.education || []);
   renderOptionCheckboxes('companySize', [
-    '20-99人','100-499人','500-999人','1000-9999人','10000人以上',
-    '不需要融资','天使轮','A轮','B轮','C轮','D轮及以上','上市公司','已上线'
+    '20-99浜?,'100-499浜?,'500-999浜?,'1000-9999浜?,'10000浜轰互涓?,
+    '涓嶉渶瑕佽瀺璧?,'澶╀娇杞?,'A杞?,'B杞?,'C杞?,'D杞強浠ヤ笂','涓婂競鍏徃','宸蹭笂绾?
   ], currentFilters.companySize || []);
 }
 
-// ===== 渲染关键字列表 =====
+// ===== 娓叉煋鍏抽敭瀛楀垪琛?=====
 function renderOptionKeywords() {
   el.keywordsList.innerHTML = '';
   allKeywords.forEach((kw, i) => {
@@ -99,7 +96,7 @@ function escHtml(str) {
   return d.innerHTML;
 }
 
-// ===== 渲染复选框组 =====
+// ===== 娓叉煋澶嶉€夋缁?=====
 function renderOptionCheckboxes(type, options, selected) {
   const container = document.getElementById(`opt-${type}-checks`);
   if (!container) return;
@@ -118,10 +115,9 @@ function renderOptionCheckboxes(type, options, selected) {
   });
 }
 
-// ===== 绑定事件 =====
+// ===== 缁戝畾浜嬩欢 =====
 function bindEvents() {
-  // 添加关键字
-  el.addKeywordBtn.addEventListener('click', () => {
+  // 娣诲姞鍏抽敭瀛?  el.addKeywordBtn.addEventListener('click', () => {
     const val = el.keywordInput.value.trim();
     if (!val || allKeywords.includes(val)) return;
     allKeywords.push(val);
@@ -133,51 +129,45 @@ function bindEvents() {
     if (e.key === 'Enter') el.addKeywordBtn.click();
   });
 
-  // 删除关键字
-  el.keywordsList.addEventListener('click', (e) => {
+  // 鍒犻櫎鍏抽敭瀛?  el.keywordsList.addEventListener('click', (e) => {
     if (e.target.classList.contains('remove')) {
       allKeywords.splice(parseInt(e.target.dataset.index), 1);
       renderOptionKeywords();
     }
   });
 
-  // 保存按钮
+  // 淇濆瓨鎸夐挳
   el.saveBtn.addEventListener('click', saveAllSettings);
 
-  // 重置所有
-  el.resetBtn.addEventListener('click', () => {
-    if (confirm('确定要重置所有设置吗？此操作不可撤销。')) {
+  // 閲嶇疆鎵€鏈?  el.resetBtn.addEventListener('click', () => {
+    if (confirm('纭畾瑕侀噸缃墍鏈夎缃悧锛熸鎿嶄綔涓嶅彲鎾ら攢銆?)) {
       chrome.storage.local.clear();
-      alert('已重置所有设置，请刷新页面。');
+      alert('宸查噸缃墍鏈夎缃紝璇峰埛鏂伴〉闈€?);
       location.reload();
     }
   });
 
-  // 清除投递记录
-  el.clearDeliveredBtn.addEventListener('click', () => {
-    if (confirm('确定清除本地已投递记录？下次运行时会重新投递相同的职位。')) {
+  // 娓呴櫎鎶曢€掕褰?  el.clearDeliveredBtn.addEventListener('click', () => {
+    if (confirm('纭畾娓呴櫎鏈湴宸叉姇閫掕褰曪紵涓嬫杩愯鏃朵細閲嶆柊鎶曢€掔浉鍚岀殑鑱屼綅銆?)) {
       localStorage.removeItem('boss_delivered_jobs');
-      alert('已清除！');
+      alert('宸叉竻闄わ紒');
     }
   });
 }
 
-// ===== 保存所有设置 =====
+// ===== 淇濆瓨鎵€鏈夎缃?=====
 async function saveAllSettings() {
-  // 收集复选框选中值
-  ['experience', 'education', 'companySize'].forEach(type => {
+  // 鏀堕泦澶嶉€夋閫変腑鍊?  ['experience', 'education', 'companySize'].forEach(type => {
     const checked = document.querySelectorAll(`#opt-${type}-checks .cb-item.selected input`);
     currentFilters[type] = Array.from(checked).map(c => c.value);
   });
 
-  // 基础筛选
-  currentFilters.area = el.areas.value.split(/[,，]/).map(a => a.trim()).filter(Boolean);
+  // 鍩虹绛涢€?  currentFilters.area = el.areas.value.split(/[,锛宂/).map(a => a.trim()).filter(Boolean);
   currentFilters.salaryMin = el.salaryMin.value;
   currentFilters.salaryMax = el.salaryMax.value;
-  currentFilters.industry = el.industries.value.split(/[,，]/).map(i => i.trim()).filter(Boolean);
+  currentFilters.industry = el.industries.value.split(/[,锛宂/).map(i => i.trim()).filter(Boolean);
 
-  // 投递设置
-  currentDelivery.maxDailyCount = parseInt(el.maxDaily.value) || 50;
+  // 鎶曢€掕缃?  currentDelivery.maxDailyCount = parseInt(el.maxDaily.value) || 50;
   currentDelivery.intervalMin = parseInt(el.intervalMin.value) || 10;
   currentDelivery.intervalMax = parseInt(el.intervalMax.value) || 30;
   currentDelivery.batchSize = parseInt(el.batchSize.value) || 5;
@@ -186,13 +176,14 @@ async function saveAllSettings() {
   currentDelivery.customGreeting = el.greeting.value;
 
   await chrome.storage.local.set({
-    [OPTIONS_KEYS.keywords]: allKeywords,
-    [OPTIONS_KEYS.filters]: currentFilters,
-    [OPTIONS_KEYS.delivery]: currentDelivery
+    [STORAGE_KEYS.keywords]: allKeywords,
+    [STORAGE_KEYS.filters]: currentFilters,
+    [STORAGE_KEYS.delivery]: currentDelivery
   });
 
-  // 显示保存成功提示
-  el.saveStatus.textContent = '✅ 设置已保存!';
+  // 鏄剧ず淇濆瓨鎴愬姛鎻愮ず
+  el.saveStatus.textContent = '鉁?璁剧疆宸蹭繚瀛?';
   el.saveStatus.classList.add('show');
   setTimeout(() => el.saveStatus.classList.remove('show'), 2000);
 }
+

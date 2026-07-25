@@ -1,11 +1,10 @@
-{
+﻿{
   "manifest_version": 3,
   "name": "Boss直聘智能投递助手",
   "version": "1.0.0",
   "description": "基于关键字和筛选条件的Boss直聘自动投递工具，智能控制频率防止封号",
   "permissions": [
-    "storage",
-    "alarms"
+    "storage"
   ],
   "host_permissions": [
     "https://www.zhipin.com/*",
@@ -17,7 +16,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.zhipin.com/*"],
-      "js": ["libs/jquery.min.js", "content.js"],
+      "js": ["content.js"],
       "css": ["styles/content.css"],
       "run_at": "document_idle"
     }

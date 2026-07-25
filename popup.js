@@ -1,285 +1,353 @@
-﻿// ============================================================
-// Popup JS - 鎺у埗闈㈡澘閫昏緫
+// ============================================================
+// Popup JS - 控制面板逻辑
+// 负责: 配置加载/保存、状态轮询、Boss页面筛选字段提取、投递日志展示
 // ============================================================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', function() {
   loadConfig();
   bindEvents();
-  startStatusPolling();
+  pollStatus();
+  // 监听 content script 发来的筛选字段数据
+  chrome.runtime.onMessage.addListener(function(msg) {
+    if (msg.action === 'filterDataUpdate') {
+      handleFilterData(msg.data);
+    }
+  });
 });
 
-// ---- 鐘舵€佸父閲?----
-const STATUS = {
+var STATUS = {
   INACTIVE: 'status-inactive',
   RUNNING: 'status-running',
   PAUSED: 'status-paused',
   ERROR: 'status-error'
 };
 
-// ---- DOM 寮曠敤 ----
-const el = {
+// ---- DOM refs ----
+var el = {
   statusBanner: document.getElementById('status-banner'),
   statusText: document.getElementById('status-text'),
-  statusSub: document.getElementById('status-sub'),
-  progressFill: document.getElementById('progress-fill'),
-  progressCount: document.getElementById('progress-count'),
-  progressLimit: document.getElementById('progress-limit'),
+  statDelivered: document.getElementById('stat-delivered'),
   statMatched: document.getElementById('stat-matched'),
   statSkipped: document.getElementById('stat-skipped'),
-  statDelivered: document.getElementById('stat-delivered'),
+  statLimit: document.getElementById('stat-limit'),
+  progressFill: document.getElementById('progress-fill'),
   toggleBtn: document.getElementById('toggle-btn'),
-  openBossBtn: document.getElementById('open-boss-btn'),
   keywordsContainer: document.getElementById('keywords-container'),
   newKeywordInput: document.getElementById('new-keyword'),
   addKeywordBtn: document.getElementById('add-keyword-btn'),
   salaryMin: document.getElementById('salary-min'),
   salaryMax: document.getElementById('salary-max'),
-  areaInput: document.getElementById('area-input'),
-  maxDaily: document.getElementById('max-daily'),
+  experienceFilters: document.getElementById('experience-filters'),
+  educationFilters: document.getElementById('education-filters'),
   intervalMin: document.getElementById('interval-min'),
   intervalMax: document.getElementById('interval-max'),
   batchSize: document.getElementById('batch-size'),
   batchPause: document.getElementById('batch-pause'),
   safeMode: document.getElementById('safe-mode'),
-  greetingMsg: document.getElementById('greeting-msg')
+  greetingMsg: document.getElementById('greeting-msg'),
+  bossFilterSource: document.getElementById('boss-filter-source'),
+  jobLogContainer: document.getElementById('job-log-container'),
+  jobLogEmpty: document.getElementById('job-log-empty')
 };
 
-let savedConfig = null;
+var config = null;
+var liveLog = []; // 实时投递日志，最多保留50条
+var currentAreas = []; // 从Boss页面提取的区域列表
+var currentSalaryRanges = []; // 当前页薪资段
 
-// ===== 鍔犺浇閰嶇疆 =====
-async function loadConfig() {
-  const result = await chrome.storage.local.get([
-    'ba_keywords',
-    'ba_filters',
-    'ba_delivery',
-    'ba_progress',
-    'ba_active'
-  ]);
+// ===== 加载配置 =====
+function loadConfig() {
+  chrome.storage.local.get([
+    'ba_keywords', 'ba_filters', 'ba_delivery',
+    'ba_progress', 'ba_active'
+  ], function(items) {
+    config = {
+      keywords: items.ba_keywords || [],
+      filters: items.ba_filters || {
+        area: [], salaryMin: '', salaryMax: '',
+        experience: [], education: []
+      },
+      delivery: items.ba_delivery || {
+        maxDailyCount: 50, intervalMinSec: 10, intervalMaxSec: 30,
+        pauseBetweenBatchesMin: 2, safeModeEnabled: true,
+        customGreeting: '您好,我对这个职位很感兴趣。', batchSize: 5
+      },
+      active: items.ba_active || false,
+      progress: items.ba_progress || { delivered: 0, skipped: 0, matched: 0 }
+    };
 
-  savedConfig = {
-    keywords: result.ba_keywords || [],
-    filters: result.ba_filters || {
-      area: [], salaryMin: '', salaryMax: '',
-      experience: [], education: [], companySize: [], jobType: ['fulltime']
-    },
-    delivery: result.ba_delivery || {
-      maxDailyCount: 50, intervalMin: 10, intervalMax: 30,
-      customGreeting: '鎮ㄥソ,鎴戝杩欎釜鑱屼綅寰堟劅鍏磋叮銆?, safeModeEnabled: true,
-      pauseBetweenBatches: 120000, batchSize: 5
-    },
-    active: result.ba_active || false,
-    progress: result.ba_progress || { delivered: 0, skipped: 0, matched: 0 }
-  };
-
-  // 娓叉煋鍏抽敭瀛楁爣绛?  renderKeywords();
-
-  // 濉厖绛涢€夊€?  el.salaryMin.value = savedConfig.filters.salaryMin || '';
-  el.salaryMax.value = savedConfig.filters.salaryMax || '';
-  el.areaInput.value = (savedConfig.filters.area || []).join(',');
-
-  // 娓叉煋澶嶉€夋缁?  renderCheckboxes('experience', ['涓嶉檺','搴斿眾缁忛獙','1-3骞?,'3-5骞?,'5-10骞?,'10骞翠互涓?]);
-  renderCheckboxes('education', ['涓嶉檺','鍒濅腑鍙婁互涓?,'涓笓/涓妧','楂樹腑','澶т笓','鏈','纭曞＋','鍗氬＋']);
-  renderCheckboxes('companySize', ['涓嶉渶瑕佽瀺璧?,'澶╀娇杞?,'A杞?,'B杞?,'C杞?,'D杞強浠ヤ笂','涓婂競鍏徃','宸蹭笂绾?,'20-99浜?,'100-499浜?,'500-999浜?,'1000-9999浜?,'10000浜轰互涓?]);
-
-  // 濉厖鎶曢€掕缃?  el.maxDaily.value = savedConfig.delivery.maxDailyCount;
-  el.intervalMin.value = savedConfig.delivery.intervalMin;
-  el.intervalMax.value = savedConfig.delivery.intervalMax;
-  el.batchSize.value = savedConfig.delivery.batchSize;
-  el.batchPause.value = Math.round((savedConfig.delivery.pauseBetweenBatches || 120000) / 60000);
-  el.safeMode.checked = savedConfig.delivery.safeModeEnabled !== false;
-  el.greetingMsg.value = savedConfig.delivery.customGreeting || '';
-  el.progressLimit.textContent = savedConfig.delivery.maxDailyCount;
-
-  updateStatus(savedConfig.active, savedConfig.progress);
+    renderKeywords();
+    populateFields();
+    renderCheckboxes();
+    updateUI();
+  });
 }
 
-// ===== 娓叉煋鍏抽敭瀛楁爣绛?=====
+// ===== 渲染关键字标签 =====
 function renderKeywords() {
   el.keywordsContainer.innerHTML = '';
-  savedConfig.keywords.forEach((kw, i) => {
-    const tag = document.createElement('span');
+  config.keywords.forEach(function(kw, i) {
+    var tag = document.createElement('span');
     tag.className = 'keyword-tag';
-    tag.innerHTML = `${escHtml(kw)} <span class="remove" data-index="${i}">&times;</span>`;
+    tag.innerHTML = escHtml(kw) + ' <span class="remove" data-i="' + i + '">&times;</span>';
     el.keywordsContainer.appendChild(tag);
   });
 }
 
-function escHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function escHtml(s) {
+  var d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
-// ===== 娓叉煋澶嶉€夋缁?=====
-function renderCheckboxes(type, options) {
-  const containerId = type + '-filters';
-  const container = document.getElementById(containerId);
-  if (!container) return;
+// ===== 填充输入框 =====
+function populateFields() {
+  el.salaryMin.value = config.filters.salaryMin || '';
+  el.salaryMax.value = config.filters.salaryMax || '';
+  el.intervalMin.value = config.delivery.intervalMinSec;
+  el.intervalMax.value = config.delivery.intervalMaxSec;
+  el.batchSize.value = config.delivery.batchSize || 5;
+  el.batchPause.value = config.delivery.pauseBetweenBatchesMin || 2;
+  el.safeMode.checked = config.delivery.safeModeEnabled !== false;
+  el.greetingMsg.value = config.delivery.customGreeting || '';
+}
 
-  const selected = savedConfig.filters[type] || [];
+// ===== 渲染复选框 =====
+function renderCheckboxes() {
+  // 经验
+  var expOptions = ['不限','应届经验','1-3年','3-5年','5-10年','10年以上'];
+  renderCheckboxGrid(el.experienceFilters, 'experience', expOptions);
 
-  options.forEach(opt => {
-    const label = document.createElement('label');
-    label.className = 'check-item' + (selected.includes(opt) ? ' checked' : '');
-    label.innerHTML = `
-      <input type="checkbox" data-type="${type}" value="${opt}" ${selected.includes(opt) ? 'checked' : ''}>
-      <span>${opt}</span>
-    `;
-    label.addEventListener('click', (e) => {
+  // 学历
+  var eduOptions = ['不限','初中及以下','中专/中技','高中','大专','本科','硕士','博士'];
+  renderCheckboxGrid(el.educationFilters, 'education', eduOptions);
+
+  // 区域（动态从Boss页面加载）
+  updateAreaDisplay();
+}
+
+function renderCheckboxGrid(container, type, options) {
+  container.innerHTML = '';
+  var selected = config.filters[type] || [];
+  options.forEach(function(opt) {
+    var label = document.createElement('label');
+    label.className = 'check-item' + (selected.indexOf(opt) !== -1 ? ' checked' : '');
+    label.setAttribute('data-type', type);
+    label.setAttribute('data-value', opt);
+    label.innerHTML = '<input type="checkbox" value="' + escHtml(opt) + '"' +
+      (selected.indexOf(opt) !== -1 ? ' checked' : '') + '>';
+    label.appendChild(document.createTextNode(opt));
+    label.addEventListener('click', function(e) {
       e.preventDefault();
-      const cb = label.querySelector('input');
-      cb.checked = !cb.checked;
-      label.classList.toggle('checked', cb.checked);
-      saveCurrentConfig();
+      label.classList.toggle('checked');
+      label.querySelector('input').checked = !label.querySelector('input').checked;
+      saveNow();
     });
     container.appendChild(label);
   });
 }
 
-// ===== 缁戝畾浜嬩欢 =====
+// ===== Boss页面筛选字段处理 =====
+function handleFilterData(data) {
+  if (!data) return;
+  currentAreas = data.areas || [];
+  currentSalaryRanges = data.salaryRanges || [];
+
+  // 更新区域显示
+  updateAreaDisplay();
+
+  // 标记已加载
+  el.bossFilterSource.className = 'filter-source-box source-loaded';
+  el.bossFilterSource.innerHTML =
+    '<div>✅ Boss直聘筛选条件已提取</div>' +
+    '<div class="filter-chips">' +
+    (currentAreas.length > 0 ? ' 区域: ' + currentAreas.map(function(a) { return '<span class="filter-chip">' + a + '</span>'; }).join(' ') : '') +
+    (currentSalaryRanges.length > 0 ? ' 薪资: ' + currentSalaryRanges.map(function(s) { return '<span class="filter-chip">' + s + '</span>'; }).join(' ') : '') +
+    '</div>';
+}
+
+function updateAreaDisplay() {
+  // 将区域作为可点击标签显示在Boss筛选信息区
+  if (currentAreas.length > 0) {
+    // 如果用户已经从Boss页面看到了区域,他们可以通过salary输入框下方的手动筛选来添加
+    // 这里我们提供一个快捷方式: 点击 chips 直接设置
+  }
+}
+
+// ===== 绑定事件 =====
 function bindEvents() {
-  // 鍏抽敭璇嶈緭鍏?  el.addKeywordBtn.addEventListener('click', addKeyword);
-  el.newKeywordInput.addEventListener('keypress', (e) => {
+  // 关键词
+  el.addKeywordBtn.addEventListener('click', addKeyword);
+  el.newKeywordInput.addEventListener('keypress', function(e) {
     if (e.key === 'Enter') addKeyword();
   });
 
-  // 鍒犻櫎鍏抽敭璇?  el.keywordsContainer.addEventListener('click', (e) => {
+  el.keywordsContainer.addEventListener('click', function(e) {
     if (e.target.classList.contains('remove')) {
-      const idx = parseInt(e.target.dataset.index);
-      savedConfig.keywords.splice(idx, 1);
+      config.keywords.splice(parseInt(e.target.dataset.i), 1);
       renderKeywords();
-      saveCurrentConfig();
+      saveLater();
     }
   });
 
-  // 鍒囨崲鎸夐挳
-  el.toggleBtn.addEventListener('click', async () => {
-    if (savedConfig.active) {
-      savedConfig.active = false;
-      el.toggleBtn.textContent = '鈻?鍚姩鑷姩鎶曢€?;
-      el.toggleBtn.classList.remove('active');
-      await chrome.runtime.sendMessage({ action: 'toggleStart', starting: false });
-      chrome.storage.local.set({ 'ba_active': false });
-    } else {
-      savedConfig.active = true;
-      el.toggleBtn.textContent = '鈴?鍋滄鑷姩鎶曢€?;
-      el.toggleBtn.classList.add('active');
-      await chrome.runtime.sendMessage({ action: 'toggleStart', starting: true });
-      chrome.storage.local.set({ 'ba_active': true });
-    }
-    saveCurrentConfig();
-    updateStatus(savedConfig.active, savedConfig.progress);
+  // 切换按钮
+  el.toggleBtn.addEventListener('click', function() {
+    var action = config.active ? 'stopDelivery' : 'startDelivery';
+    chrome.runtime.sendMessage({ action: action }, function(resp) {
+      config.active = !config.active;
+      if (config.active) {
+        el.toggleBtn.textContent = '⏸ 停止自动投递';
+        el.toggleBtn.classList.add('active');
+        el.statusText.textContent = '运行中';
+        el.statusBanner.className = 'status-banner status-running';
+      } else {
+        el.toggleBtn.textContent = '▶ 启动自动投递';
+        el.toggleBtn.classList.remove('active');
+        el.statusText.textContent = '已停止';
+        el.statusBanner.className = 'status-banner status-inactive';
+      }
+      chrome.storage.local.set({ 'ba_active': config.active });
+      saveNow();
+    });
   });
 
-  // 鎵撳紑 Boss 椤甸潰
-  el.openBossBtn.addEventListener('click', () => {
-    chrome.tabs.create({ url: 'https://www.zhipin.com/' });
+  // 输入框变更
+  var fields = [el.salaryMin, el.salaryMax, el.intervalMin, el.intervalMax,
+                el.batchSize, el.batchPause, el.greetingMsg];
+  fields.forEach(function(f) {
+    f.addEventListener('change', saveNow);
   });
-
-  // 瀹炴椂淇濆瓨鎶曢€掕缃彉鏇?  const saveFields = [el.maxDaily, el.intervalMin, el.intervalMax, el.batchSize, el.batchPause, el.safeMode, el.greetingMsg];
-  saveFields.forEach(input => {
-    input.addEventListener('change', saveCurrentConfig);
-    input.addEventListener('input', debouncedSave);
-  });
-
-  // 绛涢€夊櫒鍙樻洿
-  [el.salaryMin, el.salaryMax, el.areaInput].forEach(input => {
-    input.addEventListener('change', saveCurrentConfig);
-  });
+  el.safeMode.addEventListener('change', saveNow);
 }
 
-// ===== 娣诲姞鍏抽敭璇?=====
+// ===== 添加关键词 =====
 function addKeyword() {
-  const val = el.newKeywordInput.value.trim();
-  if (!val) return;
-  if (savedConfig.keywords.includes(val)) {
-    alert('璇ュ叧閿瘝宸插瓨鍦?);
-    return;
-  }
-  savedConfig.keywords.push(val);
+  var val = el.newKeywordInput.value.trim();
+  if (!val || config.keywords.indexOf(val) !== -1) return;
+  config.keywords.push(val);
   renderKeywords();
-  saveCurrentConfig();
+  saveLater();
   el.newKeywordInput.value = '';
 }
 
-// ===== 淇濆瓨褰撳墠閰嶇疆 =====
-let saveTimeout = null;
-const debouncedSave = () => {
-  clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(saveCurrentConfig, 800);
-};
+// ===== 保存配置 =====
+var _saveTimer = null;
+function saveLater() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveNow, 600);
+}
 
-async function saveCurrentConfig() {
-  // 鏀堕泦澶嶉€夋閫変腑鍊?  ['experience', 'education', 'companySize'].forEach(type => {
-    const checked = document.querySelectorAll(`#${type}-filters input:checked`);
-    savedConfig.filters[type] = Array.from(checked).map(c => c.value);
+function saveNow() {
+  // 收集复选框选中值
+  ['experience', 'education'].forEach(function(type) {
+    var container = type === 'experience' ? el.experienceFilters : el.educationFilters;
+    var checked = container.querySelectorAll('.check-item input:checked');
+    config.filters[type] = Array.from(checked).map(function(c) { return c.value; });
   });
 
-  // 鏀堕泦鏂囧瓧杈撳叆鍊?  savedConfig.filters.salaryMin = el.salaryMin.value;
-  savedConfig.filters.salaryMax = el.salaryMax.value;
-  savedConfig.filters.area = el.areaInput.value.split(/[,锛宂/).map(a => a.trim()).filter(Boolean);
+  config.filters.salaryMin = el.salaryMin.value;
+  config.filters.salaryMax = el.salaryMax.value;
+  config.delivery.intervalMinSec = parseInt(el.intervalMin.value) || 10;
+  config.delivery.intervalMaxSec = parseInt(el.intervalMax.value) || 30;
+  config.delivery.batchSize = parseInt(el.batchSize.value) || 5;
+  config.delivery.pauseBetweenBatchesMin = parseInt(el.batchPause.value) || 2;
+  config.delivery.safeModeEnabled = el.safeMode.checked;
+  config.delivery.customGreeting = el.greetingMsg.value;
 
-  // 鏀堕泦鎶曢€掕缃?  const batchPauseMin = parseInt(el.batchPause.value) || 2;
-  savedConfig.delivery.maxDailyCount = parseInt(el.maxDaily.value) || 50;
-  savedConfig.delivery.intervalMin = parseInt(el.intervalMin.value) || 10;
-  savedConfig.delivery.intervalMax = parseInt(el.intervalMax.value) || 30;
-  savedConfig.delivery.batchSize = parseInt(el.batchSize.value) || 5;
-  savedConfig.delivery.pauseBetweenBatches = batchPauseMin * 60000;
-  savedConfig.delivery.safeModeEnabled = el.safeMode.checked;
-  savedConfig.delivery.customGreeting = el.greetingMsg.value;
-  savedConfig.delivery.maxDailyCount = savedConfig.delivery.maxDailyCount;
-
-  // 鏇存柊 UI
-  el.progressLimit.textContent = savedConfig.delivery.maxDailyCount;
-
-  // 鎸佷箙鍖?  await chrome.storage.local.set({
-    'ba_keywords': savedConfig.keywords,
-    'ba_filters': savedConfig.filters,
-    'ba_delivery': savedConfig.delivery
+  chrome.storage.local.set({
+    'ba_keywords': config.keywords,
+    'ba_filters': config.filters,
+    'ba_delivery': config.delivery
   });
 }
 
-// ===== 鏇存柊鐘舵€佹樉绀?=====
-function updateStatus(active, progress) {
-  const banner = el.statusBanner;
-  banner.className = 'status-banner ' + (active ? STATUS.RUNNING : STATUS.INACTIVE);
-  
-  el.statusText.textContent = active ? '杩愯涓? : '宸插仠姝?;
-  el.statusSub.textContent = active ? `浠婃棩宸叉姇閫?${progress.delivered || 0}` : '鐐瑰嚮鍚姩寮€濮嬭嚜鍔ㄦ姇閫?;
-  
-  el.statMatched.textContent = progress.matched || 0;
-  el.statSkipped.textContent = progress.skipped || 0;
-  el.statDelivered.textContent = progress.delivered || 0;
+// ===== 更新UI =====
+function updateUI() {
+  if (!config) return;
+  var p = config.progress;
+  var d = config.delivery;
 
-  // 杩涘害鏉?  const limit = savedConfig?.delivery?.maxDailyCount || 50;
-  const pct = Math.min(100, ((progress.delivered || 0) / limit) * 100);
+  el.statDelivered.textContent = p.delivered || 0;
+  el.statMatched.textContent = p.matched || 0;
+  el.statSkipped.textContent = p.skipped || 0;
+  el.statLimit.textContent = d.maxDailyCount || 50;
+
+  var pct = Math.min(100, ((p.delivered || 0) / (d.maxDailyCount || 50)) * 100);
   el.progressFill.style.width = pct + '%';
 
-  // 鍒囨崲鎸夐挳
-  if (active && !el.toggleBtn.classList.contains('active')) {
-    el.toggleBtn.textContent = '鈴?鍋滄鑷姩鎶曢€?;
+  var isRunning = config.active && (p.delivered > 0 || p.matched > 0);
+  if (isRunning) {
+    el.statusText.textContent = '运行中';
+    el.statusBanner.className = 'status-banner status-running';
+    el.toggleBtn.textContent = '⏸ 停止自动投递';
     el.toggleBtn.classList.add('active');
-  } else if (!active && el.toggleBtn.classList.contains('active')) {
-    el.toggleBtn.textContent = '鈻?鍚姩鑷姩鎶曢€?;
+  } else {
+    el.statusText.textContent = '已停止';
+    el.statusBanner.className = 'status-banner status-inactive';
+    el.toggleBtn.textContent = '▶ 启动自动投递';
     el.toggleBtn.classList.remove('active');
   }
 }
 
-// ===== 鐘舵€佽疆璇?=====
-function startStatusPolling() {
-  setInterval(async () => {
-    const data = await chrome.storage.local.get([
-      'ba_active',
-      'ba_progress',
-      'ba_delivery'
-    ]);
-    savedConfig.active = data.ba_active || false;
-    savedConfig.progress = data.ba_progress || {};
-    if (data.ba_delivery) {
-      savedConfig.delivery = data.ba_delivery;
-      el.progressLimit.textContent = savedConfig.delivery.maxDailyCount || 50;
-    }
-    updateStatus(savedConfig.active, savedConfig.progress);
+// ===== 轮询状态 =====
+function pollStatus() {
+  setInterval(function() {
+    chrome.storage.local.get(['ba_active', 'ba_progress', 'ba_delivery'], function(data) {
+      if (data.ba_active !== undefined) config.active = data.ba_active;
+      if (data.ba_progress) config.progress = data.ba_progress;
+      if (data.ba_delivery) config.delivery = data.ba_delivery;
+      updateUI();
+    });
   }, 3000);
 }
 
+// ===== 投递结果回调 — 从 background 或 content 获取 =====
+chrome.runtime.onMessage.addListener(function(msg) {
+  if (msg.action === 'deliveryResult') {
+    addLogEntry(msg.result);
+  }
+});
+
+// ===== 添加日志条目 =====
+function addLogEntry(result) {
+  if (!result) return;
+  liveLog.unshift(result);
+  if (liveLog.length > 50) liveLog.pop();
+  renderLog();
+}
+
+function renderLog() {
+  // 清空容器
+  el.jobLogContainer.innerHTML = '';
+  if (liveLog.length === 0) {
+    el.jobLogContainer.appendChild(el.jobLogEmpty);
+    return;
+  }
+
+  liveLog.forEach(function(entry) {
+    var div = document.createElement('div');
+    div.className = 'job-entry';
+
+    var statusClass = entry.type === 'skip' ? 'skip' :
+                      entry.type === 'fail' ? 'fail' :
+                      entry.type === 'info' ? 'info' : 'match';
+
+    var html = '<div class="job-entry-header">' +
+      '<div class="job-entry-status ' + statusClass + '"></div>' +
+      '<span class="job-entry-title">' + escHtml(entry.title || entry.reason) + '</span>' +
+      '<span class="job-entry-time">' + (entry.time || '') + '</span>' +
+      '</div>';
+
+    if (entry.meta) {
+      html += '<div class="job-entry-meta">' +
+        '<span>' + escHtml(entry.meta) + '</span>' +
+        '</div>';
+    }
+    if (entry.reason) {
+      html += '<div class="job-entry-reason">' + escHtml(entry.reason) + '</div>';
+    }
+
+    div.innerHTML = html;
+    el.jobLogContainer.appendChild(div);
+  });
+}

@@ -1,9 +1,9 @@
 // ============================================================
-// Background Service Worker - Boss直聘智能投递调度引擎
-// 负责: 投递循环控制、频率防封、进度管理、多标签页协调
+// Background Service Worker - Boss直聘投递调度引擎
+// 负责: 投递循环、频率控制、进度管理、消息转发
 // ============================================================
 
-const STORAGE_KEYS = {
+var STORAGE_KEYS = {
   KEYWORDS: 'ba_keywords',
   FILTERS: 'ba_filters',
   DELIVERY: 'ba_delivery',
@@ -11,7 +11,6 @@ const STORAGE_KEYS = {
   PROGRESS: 'ba_progress'
 };
 
-// 默认投递配置
 var DEFAULT_DELIVERY = {
   maxDailyCount: 50,
   intervalMinSec: 10,
@@ -22,14 +21,12 @@ var DEFAULT_DELIVERY = {
   batchSize: 5
 };
 
-// 默认筛选配置
 var DEFAULT_FILTERS = {
   area: [], salaryMin: '', salaryMax: '',
   experience: [], education: [], companySize: [], jobType: ['fulltime']
 };
 
-// 运行时状态
-var runtimeState = {
+var state = {
   running: false,
   todayDelivered: 0,
   todaySkipped: 0,
@@ -50,53 +47,47 @@ chrome.runtime.onInstalled.addListener(function() {
   });
 });
 
-// ===== 每日计数重置 =====
-function resetDailyCountIfNeeded(callback) {
+// ===== 每日重置 =====
+function resetDailyIfNeeded(cb) {
   var today = new Date().toISOString().slice(0, 10);
   chrome.storage.local.get([STORAGE_KEYS.PROGRESS], function(items) {
-    var progress = items[STORAGE_KEYS.PROGRESS] || {};
-    if (progress.date !== today) {
+    var p = items[STORAGE_KEYS.PROGRESS] || {};
+    if (p.date !== today) {
       chrome.storage.local.set({
         [STORAGE_KEYS.PROGRESS]: { date: today, delivered: 0, skipped: 0, matched: 0 }
-      }, function() {
-        runtimeState.todayDelivered = 0;
-        runtimeState.todaySkipped = 0;
-        runtimeState.todayDate = today;
-        callback();
-      });
+      }, cb);
+      state.todayDelivered = 0;
+      state.todaySkipped = 0;
+      state.todayDate = today;
     } else {
-      runtimeState.todayDelivered = progress.delivered || 0;
-      runtimeState.todaySkipped = progress.skipped || 0;
-      runtimeState.todayDate = today;
-      callback();
+      state.todayDelivered = p.delivered || 0;
+      state.todaySkipped = p.skipped || 0;
+      state.todayDate = today;
+      cb();
     }
   });
 }
 
 // ===== 保存进度 =====
 function saveProgress(added, skipped) {
-  runtimeState.todayDelivered += added;
-  runtimeState.todaySkipped += skipped;
-  var today = runtimeState.todayDate || new Date().toISOString().slice(0, 10);
+  state.todayDelivered += added;
+  state.todaySkipped += skipped;
+  var today = state.todayDate || new Date().toISOString().slice(0, 10);
   chrome.storage.local.set({
     [STORAGE_KEYS.PROGRESS]: {
       date: today,
-      delivered: runtimeState.todayDelivered,
-      skipped: runtimeState.todaySkipped,
-      matched: runtimeState.todayDelivered + runtimeState.todaySkipped
+      delivered: state.todayDelivered,
+      skipped: state.todaySkipped,
+      matched: state.todayDelivered + state.todaySkipped
     }
   });
 }
 
-// ===== 获取完整配置 =====
-function getConfig(callback) {
-  chrome.storage.local.get([
-    STORAGE_KEYS.KEYWORDS,
-    STORAGE_KEYS.FILTERS,
-    STORAGE_KEYS.DELIVERY,
-    STORAGE_KEYS.ACTIVE
-  ], function(items) {
-    callback({
+// ===== 获取配置 =====
+function getConfig(cb) {
+  chrome.storage.local.get([STORAGE_KEYS.KEYWORDS, STORAGE_KEYS.FILTERS,
+                            STORAGE_KEYS.DELIVERY, STORAGE_KEYS.ACTIVE], function(items) {
+    cb({
       keywords: items[STORAGE_KEYS.KEYWORDS] || [],
       filters: Object.assign({}, DEFAULT_FILTERS, items[STORAGE_KEYS.FILTERS] || {}),
       delivery: Object.assign({}, DEFAULT_DELIVERY, items[STORAGE_KEYS.DELIVERY] || {}),
@@ -105,42 +96,17 @@ function getConfig(callback) {
   });
 }
 
-// ===== 随机整数 =====
-function randInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-// ===== 检查投递限制 =====
-function checkDeliveryLimit(config, onLimit, onContinue) {
-  var d = config.delivery;
-  if (runtimeState.todayDelivered >= d.maxDailyCount) {
-    console.log('[BossAutoApply] 今日已达上限:', runtimeState.todayDelivered);
-    stopService();
-    if (onLimit) onLimit('limit_reached');
-    return;
-  }
-  if (runtimeState.currentBatch >= d.batchSize) {
-    var pauseMs = d.pauseBetweenBatchesMin * 60000;
-    console.log('[BossAutoApply] 批次完成,休息', pauseMs / 1000, '秒');
-    broadcastStatus('batch_paused', { remaining: pauseMs });
-    setTimeout(function() {
-      runtimeState.currentBatch = 0;
-      onContinue();
-    }, pauseMs);
-    return;
-  }
-  onContinue();
-}
+function randInt(a, b) { return Math.floor(Math.random() * (b - a + 1)) + a; }
 
 // ===== 广播状态 =====
 function broadcastStatus(type, extra) {
   var payload = { type: type };
   if (extra) Object.keys(extra).forEach(function(k) { payload[k] = extra[k]; });
   payload.state = {
-    running: runtimeState.running,
-    delivered: runtimeState.todayDelivered,
-    skipped: runtimeState.todaySkipped,
-    batch: runtimeState.currentBatch
+    running: state.running,
+    delivered: state.todayDelivered,
+    skipped: state.todaySkipped,
+    batch: state.currentBatch
   };
 
   chrome.tabs.query({}, function(tabs) {
@@ -150,176 +116,139 @@ function broadcastStatus(type, extra) {
       }
     });
   });
-
-  chrome.storage.local.set({ [STORAGE_KEYS.ACTIVE]: runtimeState.running });
+  chrome.storage.local.set({ [STORAGE_KEYS.ACTIVE]: state.running });
 }
 
-// ===== 停止服务 =====
+// ===== 停止 =====
 function stopService() {
-  runtimeState.running = false;
-  runtimeState.currentBatch = 0;
+  state.running = false;
+  state.currentBatch = 0;
   broadcastStatus('stopped');
 }
 
-// ===== 消息监听 =====
-chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
-  if (msg.action === 'toggleStart') {
-    runtimeState.running = true;
-    runtimeState.activeTabId = sender.tab ? sender.tab.id : null;
-    startDeliveryCycle();
-    sendResponse({ ok: true });
-  }
-  if (msg.action === 'stopDelivery') {
-    stopService();
-    sendResponse({ ok: true });
-  }
-  // 处理 content script 的投递结果反馈
-  if (msg.action === 'jobDelivered') {
-    saveProgress(1, 0);
-    runtimeState.currentBatch++;
-    sendResponse({ ok: true });
-  }
-  if (msg.action === 'jobSkipped') {
-    saveProgress(0, 1);
-    runtimeState.currentBatch++;
-    sendResponse({ ok: true });
-  }
-  if (msg.action === 'processResult') {
-    if (msg.result && msg.result.matched) {
-      var matched = msg.result.matched;
-      runtimeState.currentBatch += matched;
-    }
-    saveProgress(msg.result ? msg.result.delivered || 0 : 0,
-                 msg.result ? msg.result.skipped || 0 : 0);
-    sendResponse({ ok: true });
-  }
-  return true; // keep channel open for async response
-});
-
-// ===== 启动投递循环 =====
-function startDeliveryCycle() {
+// ===== 主循环 =====
+function startCycle() {
   getConfig(function(config) {
     if (!config.active) {
       config.active = true;
       chrome.storage.local.set({ [STORAGE_KEYS.ACTIVE]: true });
     }
 
-    resetDailyCountIfNeeded(function() {
-      // 找到 Boss 直聘的页面
+    resetDailyIfNeeded(function() {
       chrome.tabs.query({ url: 'https://www.zhipin.com/*' }, function(tabs) {
         if (!tabs || tabs.length === 0) {
-          console.warn('[BossAutoApply] 未找到 Boss 直聘标签页');
           broadcastStatus('no_tab');
-          runtimeState.running = false;
+          state.running = false;
           return;
         }
 
-        var mainTab = tabs[0];
-        runtimeState.activeTabId = mainTab.id;
-        console.log('[BossAutoApply] 开始在 Tab', mainTab.id, '上执行投递');
-        broadcastStatus('starting', { tabUrl: mainTab.url });
-
-        runDeliveryLoop(config, mainTab.id);
+        var tab = tabs[0];
+        state.activeTabId = tab.id;
+        broadcastStatus('starting', { tabUrl: tab.url });
+        runLoop(config, tab.id);
       });
     });
   });
 }
 
-// ===== 核心投递循环 =====
-function runDeliveryLoop(config, tabId) {
-  if (!runtimeState.running) return;
+// ===== 投递循环 =====
+function runLoop(config, tabId) {
+  if (!state.running) return;
 
-  // 先通知 content script 处理当前页并找出匹配的职位
-  chrome.tabs.sendMessage(tabId, {
-    action: 'processNextPage',
-    config: {
-      keywords: config.keywords,
-      filters: config.filters,
-      deliverySettings: config.delivery
-    }
-  }, function(response) {
-    if (!response || !response.success) {
-      // 如果当前页面无数据或没有匹配,等待后重试
-      var waitMs = randInt(5000, 10000);
+  // 检查限制
+  checkLimit(config, tabId, function(canContinue) {
+    if (!canContinue) return;
+
+    // 通知 content script 处理当前页
+    chrome.tabs.sendMessage(tabId, {
+      action: 'processNextPage',
+      config: {
+        keywords: config.keywords,
+        filters: config.filters,
+        deliverySettings: config.delivery
+      }
+    }, function(response) {
+      if (response && response.success && response.matched > 0) {
+        // 有匹配的职位 — 继续下一轮（延迟后自动处理下一页）
+        state.currentBatch += response.matched;
+        showLog(tabId, '命中 ' + response.matched + ' 个职位');
+      } else if (response && !response.noJobs) {
+        showLog(tabId, '无匹配，等翻页...');
+      }
+
+      // 计算延迟
+      var delayRange = config.delivery.safeModeEnabled
+        ? [config.delivery.intervalMaxSec * 1000, config.delivery.intervalMaxSec * 2.5 * 1000]
+        : [config.delivery.intervalMinSec * 1000, config.delivery.intervalMaxSec * 1000];
+
       setTimeout(function() {
-        if (runtimeState.running) runDeliveryLoop(config, tabId);
-      }, waitMs);
-      return;
-    }
+        if (state.running) runLoop(config, tabId);
+      }, randInt(delayRange[0], delayRange[1]));
+    });
+  });
+}
 
-    var matched = response.matched || 0;
-    var skipped = response.skipped || 0;
-
-    // 如果有匹配到的职位,需要在新标签页中打开并操作
-    // 但由于 Boss 是 SPA,我们直接通过 chrome.tabs.sendMessage 触发翻页
-    // 并重复这个流程,因为每页都需要独立处理
-
-    if (matched > 0) {
-      // 有匹配的职位,逐条投递
-      var jobsToDeliver = response.jobs || [];
-      deliverMatchedJobs(config, tabId, jobsToDeliver.slice(0, 5));
-    } else if (!response.noJobs) {
-      // 本页没有匹配,检查是否还有下一页
-      checkAndGoNextPage(tabId, config);
-    }
-
-    // 计算下次投递延迟 (防封号核心)
-    var delayRange;
-    if (config.delivery.safeModeEnabled) {
-      delayRange = [config.delivery.intervalMaxSec * 1000, config.delivery.intervalMaxSec * 2.5 * 1000];
-    } else {
-      delayRange = [config.delivery.intervalMinSec * 1000, config.delivery.intervalMaxSec * 1000];
-    }
-
-    var nextDelay = randInt(delayRange[0], delayRange[1]);
-    console.log('[BossAutoApply] 等待', nextDelay / 1000, '秒后进行下一轮');
+// ===== 检查限制 =====
+function checkLimit(config, tabId, cb) {
+  var d = config.delivery;
+  if (state.todayDelivered >= d.maxDailyCount) {
+    console.log('[BossAutoApply] 今日已达上限:', state.todayDelivered);
+    stopService();
+    cb(false);
+    return;
+  }
+  if (state.currentBatch >= d.batchSize) {
+    var pauseMs = d.pauseBetweenBatchesMin * 60000;
+    console.log('[BossAutoApply] 批次完成,休息', pauseMs / 1000, '秒');
+    broadcastStatus('batch_paused');
     setTimeout(function() {
-      checkDeliveryLimit(config,
-        function(reason) { /* stopped due to limit */ },
-        function() {
-          if (runtimeState.running) runDeliveryLoop(config, tabId);
+      state.currentBatch = 0;
+      cb(true);
+    }, pauseMs);
+    return;
+  }
+  cb(true);
+}
+
+// ===== 日志转发 =====
+function showLog(tabId, message) {
+  // 转发到 popup
+  chrome.tabs.query({ url: 'chrome-extension://*/popup.html' }, function(popTabs) {
+    if (popTabs.length > 0) {
+      chrome.tabs.sendMessage(popTabs[0].id, {
+        action: 'deliveryResult',
+        result: {
+          type: 'info',
+          title: message,
+          time: new Date().toLocaleTimeString()
         }
-      );
-    }, nextDelay);
-  });
-}
-
-// ===== 投递匹配到的职位 =====
-function deliverMatchedJobs(config, tabId, jobs) {
-  if (!jobs || jobs.length === 0) return;
-
-  var jobKey = jobs[0]; // key is "title|company"
-
-  // 通知 content script 高亮标记这个职位
-  chrome.tabs.sendMessage(tabId, {
-    action: 'deliverJobFor',
-    jobKey: jobKey
-  }, function(resp) {
-    saveProgress(1, 0);
-    runtimeState.currentBatch++;
-    // 移除已投递的,继续投递下一个
-    if (jobs.length > 1) {
-      setTimeout(function() {
-        deliverMatchedJobs(config, tabId, jobs.slice(1));
-      }, randInt(2000, 4000));
+      }).catch(function(){});
     }
   });
 }
 
-// ===== 检查并翻到下一页 =====
-function checkAndGoNextPage(tabId, config) {
-  chrome.tabs.sendMessage(tabId, {
-    action: 'goNextPage'
-  }, function(resp) {
-    if (resp && resp.clicked) {
-      // 成功翻页,等待 DOM 加载
-      setTimeout(function() {
-        // 翻页后重新发送 processNextPage 处理新页面
-        chrome.tabs.sendMessage(tabId, {
-          action: 'processNextPage',
-          config: config
-        });
-      }, config.delivery.waitPageLoad || 3000);
-    }
-  });
-}
+// ===== 消息监听 =====
+chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+  if (msg.action === 'startDelivery') {
+    state.running = true;
+    startCycle();
+    sendResponse({ ok: true });
+  }
+  if (msg.action === 'stopDelivery') {
+    stopService();
+    sendResponse({ ok: true });
+  }
+  // 从 content script 接收筛选数据并转发给 popup
+  if (msg.action === 'sendFilterData') {
+    chrome.tabs.query({ url: 'chrome-extension://*/popup.html' }, function(popTabs) {
+      if (popTabs.length > 0) {
+        chrome.tabs.sendMessage(popTabs[0].id, {
+          action: 'filterDataUpdate',
+          data: msg.data
+        }).catch(function(){});
+      }
+    });
+    sendResponse({ ok: true });
+  }
+  return true;
+});

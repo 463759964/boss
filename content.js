@@ -1,78 +1,187 @@
 // ============================================================
 // Content Script - Boss直聘页面解析与增强
-// 负责: 职位卡片的提取/高亮/筛选显示, 状态指示器
-// 投递执行交由 background.js 通过 chrome.tabs.executeScript 完成
+// 核心能力:
+//   1. 提取Boss自带筛选字段（区域、薪资段、经验档位等）
+//   2. 职位卡片解析 + 高亮标记
+//   3. 投递结果实时上报 popup
+//   4. 悬浮状态指示器 + 日志面板
 // ============================================================
 
 (function() {
   'use strict';
 
-  // ---- 运行时状态 ----
-  let state = {
+  // ===== 运行时状态 =====
+  var state = {
     running: false,
     keywords: [],
     filters: {},
-    deliverySettings: {},
     currentPage: 1,
     consecutiveNonMatch: 0,
-    deliveredJobs: new Set()
+    deliveredJobs: new Set(),
+    // 从页面提取的筛选数据
+    filterData: { areas: [], salaryRanges: [] }
   };
 
-  const MAX_CONSECUTIVE_NON_MATCH = 8;
+  // 每天只提取一次筛选数据
+  var filterDataDate = '';
 
-  // ---- 加载已投递记录 ----
-  function loadDeliveredJobs() {
+  // ===== DOM 选择器 =====
+  var S = {
+    jobCard: '.job-card',
+    jobTitle: '.job-card .job-card-left .job-card-main a',
+    jobSalary: '.job-card .information span:first-child',
+    jobCompany: '.job-card .company-info h3',
+    jobArea: '.job-card .job-area',
+    jobInfo: '.job-card .job-card-main p',
+    nextBtn: '.btn.page-next, .pager_next_btn',
+    hasNext: '.page-box .pager_next:not(.disabled)',
+    // Boss直聘筛选面板
+    filterTrigger: '.job_filter_wrapper .filter-trigger, .job_filter .filter-trigger',
+    filterAreaPanel: '.area-list li, [data-field="area"] li, .job_filter .area-list li',
+    filterSalaryPanel: '.salary-range li, [data-field="salary"] li, .j-filter .salary-box .label'
+  };
+
+  // ===== 已投递记录 =====
+  function loadDelivered() {
     try {
-      const stored = localStorage.getItem('boss_delivered_jobs');
+      var stored = localStorage.getItem('boss_delivered_jobs');
       if (stored) state.deliveredJobs = new Set(JSON.parse(stored));
     } catch(e) {}
   }
 
-  function saveDeliveredJob(key) {
+  function markDelivered(key) {
     state.deliveredJobs.add(key);
-    if (state.deliveredJobs.size > 200) {
-      const arr = [...state.deliveredJobs];
-      state.deliveredJobs = new Set(arr.slice(-200));
+    if (state.deliveredJobs.size > 300) {
+      var arr = [];
+      state.deliveredJobs.forEach(function(v) { arr.push(v); });
+      state.deliveredJobs = new Set(arr.slice(-300));
     }
     localStorage.setItem('boss_delivered_jobs', JSON.stringify([...state.deliveredJobs]));
   }
 
-  loadDeliveredJobs();
+  loadDelivered();
 
-  // ===== DOM 选择器 ----
-  // Boss直聘搜索列表页的元素结构
-  var SELECTORS = {
-    jobCard: '.job-card',
-    jobTitle: '.job-card .job-card-left .job-card-main a',
-    jobSalary: '.job-card .job-card-left .information span:first-child',
-    jobCompany: '.job-card .company-info h3',
-    jobArea: '.job-card .job-card-left .job-area',
-    jobInfoP: '.job-card .job-card-left p',
-    nextBtn: '.btn.page-next',
-    hasNext: '.page-box .pager_next:not(.disabled)',
-    filterPanels: '.job_filter_wrapper .filter-body'
-  };
+  // ===== 提取Boss页面筛选字段 =====
+  function extractFilterData() {
+    // 同一天只提取一次
+    var today = new Date().toISOString().slice(0, 10);
+    if (filterDataDate === today && (state.filterData.areas.length > 0 || state.filterData.salaryRanges.length > 0)) {
+      return;
+    }
 
-  // ===== 提取职位卡片数据 =====
+    console.log('[BossAutoApply] 开始提取页面筛选字段...');
+
+    // 区域筛选 — 在搜索页面的左侧/顶部筛选栏中提取区域名
+    var areaEls = document.querySelectorAll('.filter-areabox .filter-label, .job_filter_wrapper [data-field="area"], .filter-list .label-text, [class*="area"] [class*="label"]');
+    var areas = [];
+    areaEls.forEach(function(el) {
+      var text = el.textContent.trim();
+      if (text && text.length < 20 && text.indexOf('年') === -1 && text.indexOf('万') === -1) {
+        // 排除薪资数字
+        if (/^[0-9]+/.test(text)) return;
+        areas.push(text);
+      }
+    });
+
+    // 更通用的区域提取 — 从筛选面板标签中提取
+    if (areas.length === 0) {
+      var labelEls = document.querySelectorAll('.filter-body .label, .filter-panel .label, .job_filter .filter-section .item-text, .filter-item');
+      labelEls.forEach(function(el) {
+        var text = el.textContent.trim();
+        // 常见的城市/区域名不会太长
+        if (/^(上海|北京|深圳|广州|杭州|成都|重庆|武汉|苏州|西安|南京|长沙|天津|郑州|青岛|宁波|厦门|合肥|福州|无锡|济南|东莞|佛山|常州|南通|徐州|南昌|沈阳|昆明|哈尔滨|贵阳|兰州|太原|石家庄|长春|海口|南宁|乌鲁木齐|呼和浩特|银川|西宁|拉萨)$/.test(text) ||
+            text.length >= 2 && text.length <= 6 && !/[\d\w]/.test(text)) {
+          // 避免重复
+          if (areas.indexOf(text) === -1) {
+            areas.push(text);
+          }
+        }
+      });
+    }
+
+    // 尝试从URL中的路径推断当前城市
+    var pathMatch = window.location.pathname.match(/\/([^/]+)/);
+    if (pathMatch) {
+      var cityFromUrl = pathMatch[1];
+      // 如果不是 job/list 这类API路径
+      if (!/^(job|list|api)/.test(cityFromUrl)) {
+        var alreadyAdded = false;
+        for (var i = 0; i < areas.length; i++) {
+          if (areas[i].indexOf(cityFromUrl) !== -1) {
+            alreadyAdded = true;
+            break;
+          }
+        }
+        if (!alreadyAdded) {
+          areas.unshift(cityFromUrl);
+        }
+      }
+    }
+
+    state.filterData.areas = areas.slice(0, 50); // 限制数量
+
+    // 薪资段 — 从筛选面板的薪资选项提取
+    var salaryLabels = document.querySelectorAll('.salary-box .label, [class*="salary"] .label-text, .job_filter .salary [class*="label"]');
+    var salaryRanges = [];
+    salaryLabels.forEach(function(el) {
+      var text = el.textContent.trim();
+      if (/^\d+[-~]\d+/g.test(text.replace(/\D/g, '')) || /(\d+-(\d+)).{0,4}k/i.test(text.toLowerCase())) {
+        salaryRanges.push(text);
+      } else if (/^\d+k?\s*-\s*\d+k?$/i.test(text.trim())) {
+        salaryRanges.push(text.trim());
+      }
+    });
+
+    // 备用：从职位卡片的薪资文本中收集
+    if (salaryRanges.length === 0) {
+      var salaryEls = document.querySelectorAll('.job-card .information span, .job-card .salary');
+      var seenSalaries = {};
+      salaryEls.forEach(function(el) {
+        var text = el.textContent.trim();
+        if (text && seenSalaries[text] === undefined) {
+          seenSalaries[text] = true;
+          salaryRanges.push(text);
+        }
+      });
+    }
+
+    state.filterData.salaryRanges = salaryRanges.slice(0, 20);
+
+    // 保存今天的提取结果
+    filterDataDate = today;
+
+    console.log('[BossAutoApply] 筛选数据: 区域', areas.length, '个,', '薪资段', salaryRanges.length, '个');
+
+    // 上报给 popup
+    chrome.runtime.sendMessage({
+      action: 'sendFilterData',
+      data: { areas: state.filterData.areas, salaryRanges: state.filterData.salaryRanges }
+    }).catch(function(){});
+  }
+
+  // ===== 提取职位卡片 =====
   function extractJobCards() {
-    var cards = document.querySelectorAll(SELECTORS.jobCard);
+    var cards = document.querySelectorAll(S.jobCard);
     var jobs = [];
 
     cards.forEach(function(card) {
       try {
-        var titleEl = card.querySelector(SELECTORS.jobTitle.split(' ').pop());
-        var salaryEl = card.querySelector('.job-card-left .information span:first-child');
-        var companyEl = card.querySelector('.company-info h3');
-        var infoP = card.querySelector('.job-card-left p');
-        var areaEl = card.querySelector('.job-card-left .job-area');
-
+        var titleEl = card.querySelector(S.jobTitle);
+        if (!titleEl) {
+          // 回退: 尝试更宽松的匹配
+          titleEl = card.querySelector('a[href*="job_detail"]');
+        }
         if (!titleEl) return;
 
         var title = titleEl.textContent.trim();
+        var salaryEl = card.querySelector(S.jobSalary);
         var salaryText = salaryEl ? salaryEl.textContent.trim() : '';
+        var companyEl = card.querySelector(S.jobCompany);
         var company = companyEl ? companyEl.textContent.trim() : '';
+        var areaEl = card.querySelector(S.jobArea);
         var area = areaEl ? areaEl.textContent.trim() : '';
-        var infoText = infoP ? infoP.textContent.trim() : '';
+        var infoEl = card.querySelector(S.jobInfo);
+        var infoText = infoEl ? infoEl.textContent.trim() : '';
 
         var salary = parseSalary(salaryText);
         var tags = parseInfoTags(infoText);
@@ -94,25 +203,21 @@
       }
     });
 
-    console.log('[BossAutoApply] 提取到 ' + jobs.length + ' 个职位');
     return jobs;
   }
 
-  // ===== 薪资解析 =====
   function parseSalary(text) {
     var m = text.match(/(\d+)-(\d+)/g);
     if (m && m[0]) {
       var nums = m[0].split('-').map(Number);
       return { min: nums[0], max: nums[1], unit: 'K/月' };
     }
-    return { min: 0, max: 0, unit: '' };
+    return { min: 0, max: 0 };
   }
 
-  // ===== 信息标签解析 =====
   function parseInfoTags(text) {
     var parts = text.split(/[|\s]+/);
     var result = { experience: null, education: null };
-
     for (var i = 0; i < parts.length; i++) {
       var p = parts[i].trim();
       if (/^[\d+-]+年$/.test(p) || /^[\d+-]+以下$/.test(p)) {
@@ -126,46 +231,40 @@
 
   // ===== 应用筛选条件 =====
   function applyFilters(job) {
-    var f = state.filters;
-    var kw = state.keywords;
+    var f = state.filters || {};
+    var kw = state.keywords || [];
 
-    // 1. 关键字匹配
+    // 关键字匹配
     if (kw.length > 0) {
       var matched = false;
       for (var i = 0; i < kw.length; i++) {
-        if (job.title.indexOf(kw[i]) !== -1) {
-          matched = true;
-          break;
-        }
+        if (job.title.indexOf(kw[i]) !== -1) { matched = true; break; }
       }
       if (!matched) return false;
     }
 
-    // 2. 薪资筛选
+    // 薪资
     if (f.salaryMin || f.salaryMax) {
       var minS = parseInt(f.salaryMin) || 0;
       var maxS = parseInt(f.salaryMax) || 999;
       if (job.salary.max < minS || job.salary.min > maxS) return false;
     }
 
-    // 3. 经验筛选
+    // 经验
     if (f.experience && f.experience.length > 0 && job.experience) {
       if (f.experience.indexOf(job.experience) === -1) return false;
     }
 
-    // 4. 学历筛选
+    // 学历
     if (f.education && f.education.length > 0 && job.education) {
       if (f.education.indexOf(job.education) === -1) return false;
     }
 
-    // 5. 区域筛选
+    // 区域
     if (f.area && f.area.length > 0 && job.area) {
       var areaMatched = false;
       for (var i = 0; i < f.area.length; i++) {
-        if (job.area.indexOf(f.area[i]) !== -1) {
-          areaMatched = true;
-          break;
-        }
+        if (job.area.indexOf(f.area[i]) !== -1) { areaMatched = true; break; }
       }
       if (!areaMatched) return false;
     }
@@ -173,107 +272,76 @@
     return true;
   }
 
-  // ===== 翻页 =====
-  function clickNextPage() {
-    var btn = document.querySelector(SELECTORS.nextBtn);
-    if (btn) {
-      btn.click();
-      return true;
-    }
-    // 备用选择器
-    var btn2 = document.querySelector('.pager_next_btn, .j-list .btn-next');
-    if (btn2) {
-      btn2.click();
-      return true;
-    }
-    return false;
-  }
-
-  // ===== 判断是否有下一页 =====
-  function hasMorePages() {
-    var el = document.querySelector(SELECTORS.hasNext);
-    if (el) return true;
-    // 备用检测
-    var pageBox = document.querySelector('.page-box');
-    if (pageBox) {
-      var text = pageBox.getAttribute('data-total-page');
-      if (text) return true;
-    }
-    return document.querySelectorAll(SELECTORS.jobCard).length > 0;
-  }
-
-  // ===== 高亮匹配的卡片 =====
-  function highlightJobCards(jobs) {
+  // ===== 高亮卡片 =====
+  function highlightCards(jobs) {
     for (var i = 0; i < jobs.length; i++) {
       var card = jobs[i].element;
       if (!card) continue;
-      var match = applyFilters(jobs[i]);
       var delivered = state.deliveredJobs.has(jobs[i].key);
+      var match = applyFilters(jobs[i]);
 
       card.classList.remove('autoapply-highlight', 'autoapply-delivered');
 
       if (delivered) {
         card.classList.add('autoapply-delivered');
-        card.style.opacity = '0.6';
+        card.style.opacity = '0.55';
       } else if (match) {
         card.classList.add('autoapply-highlight');
       }
     }
   }
 
-  // ===== 显示日志面板 =====
-  function showLogEntry(type, message) {
-    var existing = document.getElementById('autoapply-log-panel');
-    if (!existing) {
-      var panel = document.createElement('div');
-      panel.id = 'autoapply-log-panel';
-      panel.className = 'autoapply-log-panel';
-      panel.innerHTML = '<div class="log-title">📋 投递日志</div><div class="log-entries"></div>';
-      panel.style.cssText = 'position:fixed;top:20px;left:20px;z-index:99999;background:rgba(30,30,50,0.95);color:#e0e0e0;border-radius:10px;padding:14px 16px;font-size:12px;font-family:Menlo,Consolas,monospace;width:320px;max-height:280px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.3);backdrop-filter:blur(10px);';
-      document.body.appendChild(panel);
-    }
+  // ===== 翻页 =====
+  function clickNextPage() {
+    var btn = document.querySelector(S.nextBtn);
+    if (btn) { btn.click(); return true; }
 
-    var logPanel = document.getElementById('autoapply-log-panel');
-    var entries = logPanel.querySelector('.log-entries');
-    var div = document.createElement('div');
-    div.className = 'log-entry' + (type === 'error' ? ' log-error' : type === 'success' ? ' log-success' : '');
-    div.style.cssText = 'padding:3px 0;border-top:1px solid rgba(255,255,255,0.1);opacity:0.9;';
-    div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
-    entries.appendChild(div);
-
-    // 保留最近 50 条
-    while (entries.children.length > 50) {
-      entries.removeChild(entries.firstChild);
+    var pageBox = document.querySelector('.page-box');
+    if (pageBox) {
+      var totalStr = pageBox.getAttribute('data-total-page');
+      var currentStr = pageBox.getAttribute('data-current-page');
+      if (totalStr && currentStr && parseInt(currentStr) < parseInt(totalStr)) {
+        // 通过模拟滚动到页脚触发翻页
+        window.scrollTo(0, document.body.scrollHeight);
+        return true;
+      }
     }
-    logPanel.scrollTop = logPanel.scrollHeight;
+    return false;
   }
 
-  // ===== 处理当前页 - 由 background 触发 =====
-  function processCurrentPage(config) {
-    if (!state.running) {
-      showLogEntry('info', '自动投递未运行');
-      return { success: false, reason: 'not_running' };
+  function hasMorePages() {
+    if (document.querySelector(S.hasNext)) return true;
+    var pageBox = document.querySelector('.page-box');
+    if (pageBox) {
+      var total = pageBox.getAttribute('data-total-page');
+      var current = pageBox.getAttribute('data-current-page');
+      if (total && current && parseInt(current) < parseInt(total)) return true;
     }
+    return false;
+  }
 
-    state.keywords = config.keywords;
-    state.filters = config.filters;
-    state.deliverySettings = config.deliverySettings;
+  // ===== 处理当前页 =====
+  function processCurrentPage(config) {
+    if (!state.running) return { success: false, reason: 'not_running' };
+
+    state.keywords = config.keywords || [];
+    state.filters = config.filters || {};
+
+    // 首次或页面变化时提取筛选数据
+    extractFilterData();
 
     var jobs = extractJobCards();
-    highlightJobCards(jobs);
+    highlightCards(jobs);
 
     if (jobs.length === 0) {
-      showLogEntry('info', '当前页面无职位卡片');
-      if (hasMorePages()) {
-        clickNextPage();
-        showLogEntry('info', '已翻到下一页...');
-      }
-      return { success: true, delivered: 0, skipped: 0, noJobs: true };
+      showLog('info', '当前页面无职位卡片');
+      return { success: true, noJobs: true };
     }
 
     var matched = [];
     var skipped = 0;
     var nonMatchStreak = 0;
+    var MAX_STREAK = 8;
 
     for (var i = 0; i < jobs.length; i++) {
       var job = jobs[i];
@@ -287,9 +355,8 @@
       if (!applyFilters(job)) {
         skipped++;
         nonMatchStreak++;
-
-        if (nonMatchStreak >= MAX_CONSECUTIVE_NON_MATCH) {
-          showLogEntry('info', '连续 ' + nonMatchStreak + ' 个不匹配，准备翻页');
+        if (nonMatchStreak >= MAX_STREAK) {
+          showLog('info', '连续' + nonMatchStreak + '个不匹配，准备翻页');
           break;
         }
         continue;
@@ -299,126 +366,122 @@
       matched.push(job);
     }
 
-    showLogEntry(matched.length > 0 ? 'success' : 'info',
-      '找到 ' + matched.length + ' 个匹配职位（跳过 ' + skipped + ' 个）');
+    // 如果有匹配的
+    if (matched.length > 0) {
+      // 上报给 popup 显示
+      chrome.runtime.sendMessage({
+        action: 'deliveryResult',
+        result: {
+          type: 'match',
+          title: matched[0].title + ' | ' + matched[0].company,
+          meta: matched[0].salaryText + ' · ' + (matched[0].experience || ''),
+          time: new Date().toLocaleTimeString()
+        }
+      }).catch(function(){});
 
-    if (matched.length === 0 && hasMorePages()) {
-      showLogEntry('info', '本页无匹配，翻页...');
-      clickNextPage();
-      setTimeout(function() { showLogEntry('info', '已翻到下一页'); }, 3000);
+      showLog('success', '命中 ' + matched.length + ' 个职位');
+      for (var j = 0; j < Math.min(matched.length, 3); j++) {
+        markDelivered(matched[j].key);
+      }
+    } else {
+      showLog('info', '本页无匹配职位（跳过 ' + skipped + ' 个）');
+      if (hasMorePages()) {
+        clickNextPage();
+        setTimeout(function() {
+          showLog('info', '已翻页');
+          extractFilterData();
+        }, 3000);
+      }
     }
 
-    return { success: true, matched: matched.length, skipped: skipped, jobs: matched.map(function(j) { return j.key; }) };
+    return { success: true, matched: matched.length, skipped: skipped, jobs: matched.map(function(m) { return m.key; }) };
   }
 
-  // ===== 监听消息 =====
-  chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
-    if (msg.action === 'processNextPage') {
-      var result = processCurrentPage(msg.config);
-      sendResponse(result);
-      return false;
+  // ===== 日志面板 =====
+  var logShown = false;
+  function showLog(type, message) {
+    var panel = document.getElementById('aa-log-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'aa-log-panel';
+      panel.innerHTML = '<div id="aa-log-title" style="font-weight:600;margin-bottom:8px;font-size:13px;">📋 运行日志</div><div id="aa-log-entries"></div>';
+      panel.style.cssText = 'position:fixed;top:20px;left:20px;z-index:99999;background:rgba(20,20,40,0.92);color:#ccc;border-radius:10px;padding:12px 14px;font-size:11px;font-family:Menlo,Consolas,monospace;width:280px;max-height:240px;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,0.25);backdrop-filter:blur(8px);line-height:1.5;';
+      document.body.appendChild(panel);
+      logShown = true;
     }
-    if (msg.action === 'getStatus') {
-      sendResponse({
-        running: state.running,
-        keywords: state.keywords,
-        pages: [document.querySelectorAll(SELECTORS.jobCard).length, 0]
-      });
-      return false;
-    }
-    if (msg.action === 'startDelivery') {
-      state.running = true;
-      sendResponse({ ok: true });
-      updateIndicatorUI();
-      showLogEntry('success', '自动投递已启动');
-      return false;
-    }
-    if (msg.action === 'stopDelivery') {
-      state.running = false;
-      sendResponse({ ok: true });
-      updateIndicatorUI();
-      showLogEntry('info', '自动投递已停止');
-      return false;
-    }
-    if (msg.action === 'loadDelivered') {
-      loadDeliveredJobs();
-      sendResponse({ count: state.deliveredJobs.size });
-      return false;
-    }
-    if (msg.action === 'clearDelivered') {
-      state.deliveredJobs.clear();
-      localStorage.removeItem('boss_delivered_jobs');
-      sendResponse({ ok: true });
-      showLogEntry('info', '已清除投递记录');
-      return false;
-    }
-  });
+
+    var entries = panel.querySelector('#aa-log-entries');
+    var div = document.createElement('div');
+    div.style.cssText = 'padding:2px 0;border-top:1px solid rgba(255,255,255,0.08);opacity:0.85;';
+    if (type === 'success') div.style.color = '#69f0ae';
+    if (type === 'error') div.style.color = '#ff5252';
+    div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
+    entries.appendChild(div);
+
+    while (entries.children.length > 60) entries.removeChild(entries.firstChild);
+    panel.scrollTop = panel.scrollHeight;
+  }
 
   // ===== 悬浮指示器 =====
   function injectIndicator() {
     var wrapper = document.createElement('div');
-    wrapper.id = 'boss-autoapply-wrapper';
-    wrapper.style.cssText = 'position:fixed;top:80px;right:20px;z-index:99999;';
+    wrapper.id = 'aa-wrapper';
+    wrapper.style.cssText = 'position:fixed;top:80px;right:20px;z-index:99999;display:flex;flex-direction:column;align-items:center;gap:8px;';
 
     var circle = document.createElement('div');
-    circle.id = 'boss-autoapply-indicator';
-    circle.style.cssText = 'width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;box-shadow:0 4px 16px rgba(102,126,234,0.4);transition:all 0.3s;user-select:none;';
+    circle.id = 'aa-indicator';
+    circle.style.cssText = 'width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,#667eea,#764ba2);display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;box-shadow:0 4px 12px rgba(102,126,234,0.4);transition:all 0.3s;user-select:none;';
     circle.innerHTML = '🤖';
-    circle.title = 'Boss直聘投递助手 - 点击切换状态';
+    circle.title = '点击切换自动投递状态';
 
-    // Tooltip
+    var countBadge = document.createElement('div');
+    countBadge.id = 'aa-count';
+    countBadge.style.cssText = 'background:rgba(0,0,0,0.7);color:white;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;white-space:nowrap;';
+    countBadge.textContent = '0/日';
+
     var tooltip = document.createElement('div');
     tooltip.id = 'aa-tooltip';
-    tooltip.style.cssText = 'position:absolute;right:55px;top:50%;transform:translateY(-50%);background:rgba(20,20,40,0.92);color:#fff;padding:6px 10px;border-radius:6px;font-size:11px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:-apple-system,sans-serif;line-height:1.4;';
-    tooltip.id = 'aa-tooltip';
-    tooltip.innerHTML = '<div style="font-weight:600;margin-bottom:2px;">⚡ Boss投递助手</div><div id="aa-status-text">就绪，点击启动</div>';
-    circle.appendChild(tooltip);
+    tooltip.style.cssText = 'position:absolute;right:50px;top:50%;transform:translateY(-50%);background:rgba(20,20,40,0.92);color:#fff;padding:5px 8px;border-radius:6px;font-size:11px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:-apple-system,sans-serif;';
+    tooltip.textContent = '就绪';
 
+    circle.appendChild(tooltip);
+    wrapper.appendChild(tooltip); // positioned above circle
+    wrapper.appendChild(circle);
+    wrapper.appendChild(countBadge);
+    document.body.appendChild(wrapper);
+
+    circle.addEventListener('click', toggleRunning);
     circle.addEventListener('mouseenter', function() { tooltip.style.opacity = '1'; });
     circle.addEventListener('mouseleave', function() { tooltip.style.opacity = '0'; });
-    circle.addEventListener('click', function() { toggleState(); });
 
-    wrapper.appendChild(circle);
-    document.body.appendChild(wrapper);
-    updateIndicatorUI();
+    updateIndicator();
   }
 
-  function toggleState() {
-    if (state.running) {
-      chrome.runtime.sendMessage({ action: 'stopDelivery' });
-    } else {
-      chrome.runtime.sendMessage({ action: 'startDelivery' });
-    }
+  function toggleRunning() {
+    state.running = !state.running;
+    var action = state.running ? 'startDelivery' : 'stopDelivery';
+    chrome.runtime.sendMessage({ action: action });
+    updateIndicator();
   }
 
-  function updateIndicatorUI() {
-    var indicator = document.getElementById('boss-autoapply-indicator');
-    var statusText = document.getElementById('aa-status-text');
-    if (!indicator || !statusText) return;
+  function updateIndicator() {
+    var circle = document.getElementById('aa-indicator');
+    var badge = document.getElementById('aa-count');
+    var tip = document.getElementById('aa-tooltip');
+    if (!circle || !badge || !tip) return;
 
     if (state.running) {
-      indicator.innerHTML = '⏸ <div id="aa-tooltip" style="position:absolute;right:55px;top:50%;transform:translateY(-50%);background:rgba(20,20,40,0.92);color:#fff;padding:6px 10px;border-radius:6px;font-size:11px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:-apple-system,sans-serif;line-height:1.4;"><div style="font-weight:600;margin-bottom:2px;">⚡ 运行中</div></div>';
-      indicator.style.background = 'linear-gradient(135deg,#f093fb 0%,#f5576c 100%)';
-      statusText.textContent = '运行中 - 点击停止';
-      statusText.style.display = 'block';
+      circle.style.background = 'linear-gradient(135deg,#f093fb,#f5576c)';
+      circle.innerHTML = '⏸';
+      tip.textContent = '运行中 - 点击停止';
+      badge.textContent = '⏳';
     } else {
-      indicator.innerHTML = '🤖 <div id="aa-tooltip" style="position:absolute;right:55px;top:50%;transform:translateY(-50%);background:rgba(20,20,40,0.92);color:#fff;padding:6px 10px;border-radius:6px;font-size:11px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 0.2s;font-family:-apple-system,sans-serif;line-height:1.4;"><div style="font-weight:600;margin-bottom:2px;">⚡ Boss投递助手</div><div id="aa-status-text">就绪，点击启动</div></div>';
-      indicator.style.background = 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)';
-      statusText.textContent = '就绪，点击启动';
+      circle.style.background = 'linear-gradient(135deg,#667eea,#764ba2)';
+      circle.innerHTML = '🤖';
+      tip.textContent = '就绪 - 点击启动';
+      badge.textContent = '0/日';
     }
   }
-
-  // ===== 监听状态广播 =====
-  chrome.runtime.onMessage.addListener(function(msg) {
-    if (msg.type) {
-      if (msg.type === 'starting') {
-        state.running = true;
-      } else if (msg.type === 'stopped') {
-        state.running = false;
-      }
-      updateIndicatorUI();
-    }
-  });
 
   // ===== CSS 注入 =====
   function injectCSS() {
@@ -427,12 +490,10 @@
       '.job-card.autoapply-highlight {' +
       '  outline: 2px solid #667eea !important;' +
       '  outline-offset: 2px !important;' +
+      '  box-shadow: 0 0 0 0 rgba(102,126,234,0.3) !important;' +
       '}' +
       '.job-card.autoapply-delivered {' +
-      '  opacity: 0.5 !important;' +
-      '}' +
-      '.autoapply-log-panel .log-title {' +
-      '  font-weight:600;margin-bottom:8px;font-size:13px;' +
+      '  opacity: 0.55 !important;' +
       '}';
     document.head.appendChild(style);
   }
@@ -441,25 +502,58 @@
   function init() {
     injectCSS();
     injectIndicator();
-    showLogEntry('info', 'Boss直聘投递助手已加载');
+    showLog('info', 'Boss投递助手已加载');
 
-    // 定期检查页面变化（Boss是SPA，会动态更新DOM）
+    // Boss是SPA，定期检查DOM变化
     setInterval(function() {
       if (state.running) {
-        var cards = document.querySelectorAll(SELECTORS.jobCard);
+        var cards = document.querySelectorAll(S.jobCard);
         if (cards.length > 0) {
           var jobs = extractJobCards();
-          highlightJobCards(jobs);
+          highlightCards(jobs);
         }
       }
     }, 5000);
   }
 
-  // Boss直聘是SPA，DOM会动态加载，延迟初始化确保页面就绪
+  // ===== 消息监听 =====
+  chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+    if (msg.action === 'processNextPage') {
+      var result = processCurrentPage(msg.config);
+      sendResponse(result);
+      return false;
+    }
+    if (msg.action === 'getStatus') {
+      sendResponse({ running: state.running });
+      return false;
+    }
+    if (msg.action === 'startDelivery') {
+      state.running = true;
+      updateIndicator();
+      showLog('success', '自动投递已启动');
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (msg.action === 'stopDelivery') {
+      state.running = false;
+      updateIndicator();
+      showLog('info', '已停止');
+      sendResponse({ ok: true });
+      return false;
+    }
+  });
+
+  // 接收 background 的状态广播
+  chrome.runtime.onMessage.addListener(function(msg) {
+    if (msg.state) {
+      updateIndicator();
+    }
+  });
+
+  // 启动
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
     init();
   }
-
 })();

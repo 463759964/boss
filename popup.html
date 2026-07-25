@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boss投递助手</title>
+  <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+  <div class="popup">
+    <!-- Header -->
+    <header class="popup-header">
+      <div class="header-left">
+        <span class="logo-icon">💼</span>
+        <h1 class="app-title">Boss直聘<br><small>智能投递助手</small></h1>
+      </div>
+      <a href="options.html" class="settings-btn" title="设置">⚙️</a>
+    </header>
+
+    <!-- Status Banner -->
+    <div id="status-banner" class="status-banner status-inactive">
+      <div class="status-dot"></div>
+      <span id="status-text">已停止</span>
+      <span id="status-sub" class="status-sub">点击启动开始自动投递</span>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-section">
+      <div class="progress-labels">
+        <span>今日投递</span>
+        <span id="progress-count">0 / <span id="progress-limit">50</span></span>
+      </div>
+      <div class="progress-bar">
+        <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+      </div>
+      <div class="progress-stats">
+        <span>匹配: <b id="stat-matched">0</b></span>
+        <span>跳过: <b id="stat-skipped">0</b></span>
+        <span>成功: <b id="stat-delivered">0</b></span>
+      </div>
+    </div>
+
+    <!-- Main Controls -->
+    <div class="controls">
+      <!-- Keywords Section -->
+      <details class="section open" open>
+        <summary>🎯 投递关键字</summary>
+        <div class="section-content">
+          <p class="hint">输入职位关键词,支持多个,逗号分隔</p>
+          <div id="keywords-container" class="keyword-tags"></div>
+          <input type="text" id="new-keyword" class="input-field keyword-input" placeholder="输入关键词...">
+          <button id="add-keyword-btn" class="btn btn-sm btn-outline">+ 添加</button>
+        </div>
+      </details>
+
+      <!-- Filters Section -->
+      <details class="section">
+        <summary>🔍 筛选条件</summary>
+        <div class="section-content">
+          <label class="filter-group">
+            <span>最低薪资 (K/月)</span>
+            <input type="number" id="salary-min" class="input-field small" placeholder="例如: 15">
+          </label>
+          <label class="filter-group">
+            <span>最高薪资 (K/月)</span>
+            <input type="number" id="salary-max" class="input-field small" placeholder="例如: 30">
+          </label>
+          
+          <div class="filter-section-title">经验要求</div>
+          <div id="experience-filters" class="checkbox-grid"></div>
+          
+          <div class="filter-section-title">学历要求</div>
+          <div id="education-filters" class="checkbox-grid"></div>
+          
+          <div class="filter-section-title">公司规模</div>
+          <div id="company-size-filters" class="checkbox-grid"></div>
+          
+          <div class="filter-section-title">工作区域</div>
+          <input type="text" id="area-input" class="input-field" placeholder="输入区域,逗号分隔(如:徐汇,黄浦)">
+        </div>
+      </details>
+
+      <!-- Delivery Settings -->
+      <details class="section">
+        <summary>⚙️ 投递设置</summary>
+        <div class="section-content">
+          <label class="filter-group">
+            <span>每日最大投递数</span>
+            <input type="number" id="max-daily" class="input-field small" value="50">
+          </label>
+          <label class="filter-group">
+            <span>每次间隔最小 (秒)</span>
+            <input type="number" id="interval-min" class="input-field small" value="10">
+          </label>
+          <label class="filter-group">
+            <span>每次间隔最大 (秒)</span>
+            <input type="number" id="interval-max" class="input-field small" value="30">
+          </label>
+          <label class="filter-group">
+            <span>每批投递数量</span>
+            <input type="number" id="batch-size" class="input-field small" value="5">
+          </label>
+          <label class="filter-group">
+            <span>批次间休息 (分钟)</span>
+            <input type="number" id="batch-pause" class="input-field small" value="2">
+          </label>
+          <label class="filter-group checkbox-row">
+            <input type="checkbox" id="safe-mode">
+            <span>安全模式 (更保守的频率)</span>
+          </label>
+          <label class="filter-group">
+            <span>自定义打招呼语</span>
+            <textarea id="greeting-msg" class="input-field textarea" rows="2" placeholder="您好,我对这个职位很感兴趣..."></textarea>
+          </label>
+        </div>
+      </details>
+    </div>
+
+    <!-- Action Buttons -->
+    <footer class="popup-footer">
+      <button id="toggle-btn" class="btn btn-primary btn-full">
+        ▶ 启动自动投递
+      </button>
+      <button id="open-boss-btn" class="btn btn-secondary btn-full">
+        🌐 打开 Boss 直聘页面
+      </button>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

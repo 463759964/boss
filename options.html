@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Boss投递助手 - 高级设置</title>
+  <link rel="stylesheet" href="styles/options.css">
+</head>
+<body>
+  <div class="options-page">
+    <nav class="breadcrumb">
+      <a href="#" onclick="chrome.runtime.openOptionsPage(); return false;">⬅ 返回</a>
+    </nav>
+    
+    <h1>🔧 高级设置</h1>
+
+    <!-- Keyword Management -->
+    <section class="card">
+      <h2>管理关键字</h2>
+      <p class="desc">添加或删除你想要投递的职位关键字。支持模糊匹配。</p>
+      <div class="keyword-management">
+        <div id="opt-keywords" class="tag-list"></div>
+        <div class="add-row">
+          <input type="text" id="opt-keyword-input" class="input-field" placeholder="输入新关键字...">
+          <button id="opt-add-keyword" class="btn btn-primary">+ 添加</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Area & District -->
+    <section class="card">
+      <h2>区域筛选</h2>
+      <p class="desc">Boss直聘的城市/区域筛选条件（从搜索结果页自动提取）。</p>
+      <label class="form-label">
+        <span>优先区域 (逗号分隔)</span>
+        <input type="text" id="opt-areas" class="input-field" placeholder="徐汇,黄浦,静安,浦东">
+      </label>
+      <label class="form-label">
+        <span>排除区域 (逗号分隔)</span>
+        <input type="text" id="opt-exclude-areas" class="input-field" placeholder="长宁,闵行(不想投递的区域)">
+      </label>
+    </section>
+
+    <!-- Salary Range -->
+    <section class="card">
+      <h2>薪资范围</h2>
+      <div class="salary-inputs">
+        <label class="form-label">
+          <span>最低月薪 (K)</span>
+          <input type="number" id="opt-salary-min" class="input-field" min="0" max="999" placeholder="如: 15">
+        </label>
+        <label class="form-label">
+          <span>最高月薪 (K)</span>
+          <input type="number" id="opt-salary-max" class="input-field" min="0" max="999" placeholder="如: 50">
+        </label>
+      </div>
+    </section>
+
+    <!-- Experience -->
+    <section class="card">
+      <h2>经验要求</h2>
+      <p class="desc">选择你接受的工作经验门槛</p>
+      <div id="opt-experience-checks" class="checkbox-group"></div>
+    </section>
+
+    <!-- Education -->
+    <section class="card">
+      <h2>学历要求</h2>
+      <p class="desc">选择你的学历门槛</p>
+      <div id="opt-education-checks" class="checkbox-group"></div>
+    </section>
+
+    <!-- Company Size -->
+    <section class="card">
+      <h2>公司规模</h2>
+      <p class="desc">选择目标公司的人数规模</p>
+      <div id="opt-company-size-checks" class="checkbox-group"></div>
+    </section>
+
+    <!-- Industry -->
+    <section class="card">
+      <h2>行业偏好</h2>
+      <p class="desc">选择感兴趣的行业领域（留空表示不限）</p>
+      <textarea id="opt-industries" class="input-field textarea" rows="3" placeholder="互联网、电子商务、人工智能、金融..."></textarea>
+    </section>
+
+    <!-- Delivery Configuration -->
+    <section class="card">
+      <h2>投递频率控制</h2>
+      <p class="desc">这些参数决定了自动投递的节奏，防止被平台封号</p>
+      
+      <label class="form-label">
+        <span>每日最大投递数</span>
+        <input type="number" id="opt-max-daily" class="input-field" min="1" max="200" value="50">
+      </label>
+      
+      <label class="form-label">
+        <span>单次投递间隔最小值 (秒)</span>
+        <input type="number" id="opt-interval-min" class="input-field" min="3" max="120" value="10">
+      </label>
+      
+      <label class="form-label">
+        <span>单次投递间隔最大值 (秒)</span>
+        <input type="number" id="opt-interval-max" class="input-field" min="5" max="300" value="30">
+      </label>
+      
+      <label class="form-label">
+        <span>每批投递数量</span>
+        <input type="number" id="opt-batch-size" class="input-field" min="1" max="20" value="5">
+        <small class="field-hint">每批投递几个后暂停休息一次</small>
+      </label>
+      
+      <label class="form-label">
+        <span>批次间休息时间 (分钟)</span>
+        <input type="number" id="opt-batch-pause" class="input-field" min="1" max="60" value="2">
+        <small class="field-hint">模拟人类需要喝水上厕所的时间 😄</small>
+      </label>
+
+      <label class="form-label checkbox-label">
+        <input type="checkbox" id="opt-safe-mode" checked>
+        <span>启用安全模式（更长的随机间隔，更保守的策略）</span>
+      </label>
+
+      <label class="form-label">
+        <span>自定义打招呼语</span>
+        <textarea id="opt-greeting" class="input-field textarea" rows="3" placeholder="您好,我对这个职位很感兴趣..."></textarea>
+        <small class="field-hint">发送给HR的第一条消息内容</small>
+      </label>
+    </section>
+
+    <!-- Danger Zone -->
+    <section class="card danger-zone">
+      <h2>⚠️ 危险操作</h2>
+      <div class="danger-actions">
+        <button id="opt-reset-all" class="btn btn-danger">重置所有设置</button>
+        <button id="opt-clear-delivered" class="btn btn-warning">清除已投递记录</button>
+      </div>
+    </section>
+
+    <footer class="options-footer">
+      <button id="opt-save" class="btn btn-primary btn-lg">💾 保存全部设置</button>
+      <div id="opt-save-status" class="save-status"></div>
+    </footer>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

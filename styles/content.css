@@ -1,0 +1,101 @@
+/* ============================================================
+   Content Script Styles - 注入Boss直聘页面的增强样式
+   ============================================================ */
+
+/* 职位卡片高亮标记 */
+.job-card.highlighted {
+  outline: 2px solid #667eea !important;
+  outline-offset: 2px;
+}
+
+.job-card.matched {
+  background: rgba(102, 126, 234, 0.05) !important;
+}
+
+/* 筛选面板样式增强 */
+.filter-panel-enhanced {
+  position: fixed;
+  top: 60px;
+  right: 20px;
+  z-index: 9998;
+  background: white;
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+  padding: 14px;
+  font-size: 12px;
+  min-width: 200px;
+}
+
+.filter-panel-enhanced h3 {
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: #333;
+}
+
+.filter-panel-enhanced .match-result {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.filter-panel-enhanced .match-result:last-child {
+  border-bottom: none;
+}
+
+.filter-pass { color: #4caf50; }
+.filter-fail { color: #f44336; }
+
+/* 投递日志浮窗 */
+.autoapply-log-panel {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9999;
+  background: rgba(0,0,0,0.8);
+  color: #fff;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 12px;
+  max-width: 300px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: 'Monaco', 'Consolas', monospace;
+}
+
+.autoapply-log-panel .log-entry {
+  padding: 2px 0;
+  opacity: 0.9;
+}
+
+.autoapply-log-panel .log-entry.log-error {
+  color: #ff5252;
+}
+
+.autoapply-log-panel .log-entry.log-success {
+  color: #69f0ae;
+}
+
+/* 跳过提示 */
+.skip-indicator {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(255,82,82,0.9);
+  color: white;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  z-index: 99999;
+  pointer-events: none;
+  animation: fadeInOut 1.5s ease forwards;
+}
+
+@keyframes fadeInOut {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+  20% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}

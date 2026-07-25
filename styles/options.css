@@ -1,0 +1,262 @@
+/* ============================================================
+   Options Page Styles
+   ============================================================ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: #f0f2f5;
+  color: #1a1a2e;
+  line-height: 1.6;
+}
+
+.options-page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 20px 60px;
+}
+
+.breadcrumb {
+  margin-bottom: 20px;
+}
+
+.breadcrumb a {
+  color: #667eea;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+h1 {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 20px;
+  color: #1a1a2e;
+}
+
+.card {
+  background: white;
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+
+.card h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.card .desc {
+  font-size: 12px;
+  color: #999;
+  margin-bottom: 14px;
+}
+
+.form-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.field-hint {
+  font-size: 11px;
+  color: #aaa;
+  font-weight: 400;
+}
+
+.checkbox-label {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #667eea;
+}
+
+.input-field {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid #d9dce0;
+  border-radius: 8px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  font-family: inherit;
+}
+
+.input-field:focus {
+  border-color: #667eea;
+  box-shadow: 0 0 0 3px rgba(102,126,234,0.12);
+}
+
+.input-field.textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.salary-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+/* Keyword tags in options */
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.tag-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #f0f0ff;
+  color: #5b4cc7;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.tag-item .remove {
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+
+.tag-item .remove:hover {
+  opacity: 1;
+}
+
+.add-row {
+  display: flex;
+  gap: 8px;
+}
+
+.add-row .input-field {
+  flex: 1;
+}
+
+/* Checkbox group */
+.checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cb-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid #e0e0e0;
+  border-radius: 18px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  user-select: none;
+}
+
+.cb-item:hover {
+  border-color: #667eea;
+  background: #f8f7ff;
+}
+
+.cb-item.selected {
+  background: #667eea;
+  color: white;
+  border-color: #667eea;
+}
+
+.cb-item input {
+  display: none;
+}
+
+/* Danger Zone */
+.danger-zone {
+  border: 1px solid #ffebee;
+}
+
+.danger-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 18px;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.1);
+  box-shadow: 0 4px 12px rgba(102,126,234,0.3);
+}
+
+.btn-danger {
+  background: #ff5252;
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #ff1744;
+}
+
+.btn-warning {
+  background: #ffa726;
+  color: white;
+}
+
+.btn-warning:hover {
+  background: #fb8c00;
+}
+
+.btn-lg {
+  padding: 12px 24px;
+  font-size: 15px;
+}
+
+/* Footer */
+.options-footer {
+  margin-top: 24px;
+  text-align: center;
+}
+
+.save-status {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #4caf50;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.save-status.show {
+  opacity: 1;
+}

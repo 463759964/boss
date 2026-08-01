@@ -13,10 +13,17 @@ def quick_score(job: dict, config: dict) -> tuple[int, str]:
     profile = config.get("profile", {})
     deal_breakers = profile.get("deal_breakers", [])
     title = job.get("title") or ""
+    company = job.get("company") or ""
+    print(company)
 
     breaker = matching_deal_breaker(title, deal_breakers)
     if breaker:
         return 0, f"触发排除词: {breaker}"
+
+    # 过滤公司名 ← 新增
+    breaker = matching_deal_breaker(company, deal_breakers)
+    if breaker:
+        return 0, f"触发排除词(公司): {breaker}"
 
     if not profile.get("allow_internship", False) and _contains_internship_signal(job):
         return 0, "实习/管培岗位"

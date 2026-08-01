@@ -283,11 +283,28 @@ def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
 	config = dict(config)
 	config["_workbench_stop_event"] = task.stop_requested
 	config["_workbench_log"] = lambda message: _log(task, message)
+
 	if not config.get("_workbench_skip_greeting"):
 		_log(task, "生成招呼语")
 		generate_greetings(config)
 		if task.stop_requested.is_set():
 			return
+
+		# ── 关键补丁：greeter 会把 approved → ready，这里自动推回 approved ──
+		db = _get_web_db()
+		try:
+			ready_jobs = get_jobs_ready_to_send(db)
+			# 如果指定了 job_ids，只审批这批
+			target_ids = set(config.get("_workbench_job_ids", []))
+			for job in ready_jobs:
+				if target_ids and str(job["id"]) not in target_ids:
+					continue
+				update_job_status(db, job["id"], "approved")
+			if ready_jobs:
+				_log(task, f"自动确认 {len(ready_jobs)} 个岗位，准备发送")
+		finally:
+			db.close()
+
 	_log(task, "发送招呼语")
 	send_greetings(config, force=True)
 

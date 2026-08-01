@@ -1,15 +1,24 @@
-"""AI Greeter - Generate personalized greeting messages with self-review."""
+"""AI Greeter - Generate personalized greeting messages with self-review and fallback."""
 
 import json
+import time
+import random
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from bosshunter.ai.credentials import AIRequestError, call_anthropic_text
+from bosshunter.ai.credentials import AIRequestError
 from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, update_job_status
 
 console = Console()
+
+# ─── 兜底与限流配置 ───────────────────────────────────────────────
+DEFAULT_GREETING = "您好"
+MAX_GENERATE_RETRIES = 3       # 单次生成最大重试
+MAX_REVIEW_RETRIES = 2         # 自评最大重试（失败不阻塞）
+GLOBAL_REQUEST_INTERVAL = 3.0  # 🆕 全局请求间隔(秒)，防止触碰RPM上限
 
 GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送打招呼消息。请根据以下信息生成一条个性化、自然的招呼语。
 
@@ -60,7 +69,6 @@ REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 
 
 def _get_resume_summary(config: dict) -> str:
-    """Get a brief resume summary for greeting generation."""
     resume_path = Path(config.get("profile", {}).get("resume_path", "./resume.md"))
     if not resume_path.exists():
         return ""
@@ -68,9 +76,100 @@ def _get_resume_summary(config: dict) -> str:
     return content[:1500]
 
 
-def _call_claude(prompt: str, config: dict, max_tokens: int = 300) -> str | None:
-    """Call Claude API and return response text."""
-    return call_anthropic_text(prompt, config, max_tokens)
+def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1) -> str | None:
+    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避）"""
+    ai_cfg = config.get("ai", {})
+    provider = ai_cfg.get("provider", "openai_compatible")
+
+    if provider != "openai_compatible":
+        console.print(f"[red]不支持的 AI provider: {provider}[/red]")
+        return None
+
+    base_url = ai_cfg.get("base_url", "").rstrip("/")
+    api_key = ai_cfg.get("api_key", "")
+    model = ai_cfg.get("model", "")
+
+    # ─── 调试：打印实际使用的配置 ───────────────────────
+    masked_key = f"{api_key[:8]}..." if len(api_key) > 8 else "(empty)"
+    console.print(f"[dim]🔧 AI配置: model={model}, base_url={base_url}, key={masked_key}[/dim]")
+
+    if not all([base_url, api_key, model]):
+        console.print("[red]AI 配置不完整，请检查 config.yaml 中 ai 段[/red]")
+        return None
+
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60)
+
+        # ─── 调试：打印响应状态码和原始内容 ───────────────
+        console.print(f"[dim]📡 HTTP {resp.status_code} | 响应长度: {len(resp.text)}[/dim]")
+        if resp.status_code != 200:
+            console.print(f"[red]❌ API错误响应: {resp.text[:500]}[/red]")
+
+        # 🆕 429 智能退避：不再立即抛异常，而是原地等待后重试
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                wait_time = float(retry_after) + random.uniform(0.5, 1.5)
+            else:
+                wait_time = min(60, 3 * (2 ** (attempt - 1))) + random.uniform(0, 2)
+
+            console.print(
+                f"[yellow]⏳ 触发RPM限流，等待 {wait_time:.1f}s 后重试 "
+                f"(第{attempt}/{MAX_GENERATE_RETRIES}次)[/yellow]"
+            )
+            time.sleep(wait_time)
+            raise AIRequestError(kind="token_quota", message=f"HTTP 429: RPM exhausted, waited {wait_time:.1f}s")
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        # ─── 调试：打印解析后的消息结构 ───────────────────
+        choices = data.get("choices", [])
+        if not choices:
+            console.print(f"[red]❌ 响应中无 choices 字段: {str(data)[:300]}[/red]")
+            return None
+
+        msg = choices[0].get("message", {})
+        content = msg.get("content") or msg.get("reasoning_content") or msg.get("text") or ""
+
+        if not content:
+            console.print(f"[yellow]⚠ AI返回空内容，完整message: {msg}[/yellow]")
+            return None
+
+        console.print(f"[dim]✅ AI返回成功，内容长度: {len(content)}[/dim]")
+        return content.strip()
+
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        body = exc.response.text[:500]
+        console.print(f"[red]❌ HTTP {status}: {body}[/red]")
+        if status in (401, 403):
+            kind = "auth"
+        elif status == 429:
+            kind = "token_quota"
+        elif status == 400 and "context" in body.lower():
+            kind = "context_limit"
+        else:
+            kind = "unknown"
+        raise AIRequestError(kind=kind, message=f"HTTP {status}: {body}") from exc
+    except Exception as exc:
+        # 避免重复打印已在上面处理过的429日志
+        if isinstance(exc, AIRequestError) and exc.kind == "token_quota":
+            raise
+        console.print(f"[red]❌ 请求异常: {type(exc).__name__}: {exc}[/red]")
+        raise AIRequestError(kind="network", message=str(exc)) from exc
 
 
 def _truncate_prompt_text(text: str, limit: int) -> str:
@@ -95,14 +194,14 @@ def _review_greeting(
     job: dict,
     config: dict,
     max_tokens: int = 300,
+    attempt: int = 1,
 ) -> dict | None:
-    """Self-evaluate a greeting. Returns scores dict or None on failure."""
     prompt = REVIEW_PROMPT.format(
         title=job["title"],
         company=job["company"],
         greeting=greeting,
     )
-    response = _call_claude(prompt, config, max_tokens)
+    response = _call_ai(prompt, config, max_tokens, attempt=attempt)
     if not response:
         return None
     try:
@@ -123,14 +222,13 @@ def _generate_greeting_once(
     *,
     compact: bool = False,
     max_tokens: int = 300,
+    attempt: int = 1,
 ) -> str | None:
-    """Generate a single greeting attempt."""
     jd_limit = 250 if compact else 500
     resume_limit = 800 if compact else 1500
     jd_summary = _truncate_prompt_text(job.get("jd", ""), jd_limit) or "无详细描述"
     critique_section = f"\n7. 上次生成的问题: {critique}，请避免此问题\n" if critique else ""
 
-    # Build extra highlights from config (portfolio URL, personal strengths, etc.)
     profile_cfg = config.get("profile", {})
     highlights = profile_cfg.get("extra_highlights", [])
     portfolio_url = profile_cfg.get("portfolio_url", "")
@@ -150,13 +248,11 @@ def _generate_greeting_once(
         extra_highlights=_truncate_prompt_text(extra_highlights, 500),
     )
 
-    greeting = _call_claude(prompt, config, max_tokens)
+    greeting = _call_ai(prompt, config, max_tokens, attempt=attempt)
     if not greeting:
         return None
 
-    # Clean up
     greeting = greeting.strip('"\'')
-    # Enforce max length
     if len(greeting) > 150:
         cut = greeting[:150]
         for sep in ("。", "！", "～", "！", "\n"):
@@ -170,168 +266,163 @@ def _generate_greeting_once(
     return greeting
 
 
-def _generate_with_token_retry(
+def _generate_with_retry(
     job: dict,
     resume_summary: str,
     config: dict,
     critique: str = "",
 ) -> str | None:
-    """Retry only request-size/output-limit failures without changing batch size."""
-    try:
-        return _generate_greeting_once(job, resume_summary, config, critique)
-    except AIRequestError as exc:
-        if exc.kind == "output_truncated":
-            _notify(config, f"{job['company']}｜{job['title']} 的招呼语回答被截断，正在增大输出 Token 上限后重试。")
-            compact = False
-            retry_max_tokens = 600
-        elif exc.kind == "output_limit":
-            _notify(config, f"{job['company']}｜{job['title']} 正在降低单次输出 Token 上限后重试招呼语。")
-            compact = False
-            retry_max_tokens = 160
-        elif exc.kind == "context_limit":
-            _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试招呼语。")
-            compact = True
-            retry_max_tokens = 160
-        else:
-            raise
+    """尝试生成招呼语，最多 MAX_GENERATE_RETRIES 次。全部失败返回 None。"""
+    last_error: Exception | None = None
 
-    try:
-        return _generate_greeting_once(
-            job,
-            resume_summary,
-            config,
-            critique,
-            compact=compact,
-            max_tokens=retry_max_tokens,
-        )
-    except AIRequestError as retry_exc:
-        if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
-            _notify(
-                config,
-                f"已跳过 {job['company']}｜{job['title']}：调整单次 Token 请求后仍失败。",
+    for attempt in range(1, MAX_GENERATE_RETRIES + 1):
+        try:
+            result = _generate_greeting_once(job, resume_summary, config, critique, attempt=attempt)
+            if result:
+                return result
+            last_error = ValueError("AI 返回空内容")
+        except AIRequestError as exc:
+            last_error = exc
+            if exc.kind in ("token_quota", "auth"):
+                # 🆕 429 已在 _call_ai 内部等待过，这里直接继续下一次重试
+                if exc.kind == "auth":
+                    console.print(f"[red]  AI 凭证问题（{exc.kind}），停止重试[/red]")
+                    break
+                # token_quota 不break，让循环继续（_call_ai已经sleep过了）
+            if exc.kind == "context_limit" and attempt < MAX_GENERATE_RETRIES:
+                try:
+                    result = _generate_greeting_once(
+                        job, resume_summary, config, critique,
+                        compact=True, max_tokens=160, attempt=attempt,
+                    )
+                    if result:
+                        return result
+                except AIRequestError:
+                    pass
+        except Exception as exc:
+            last_error = exc
+
+        if attempt < MAX_GENERATE_RETRIES:
+            console.print(
+                f"[yellow]  招呼语生成第 {attempt} 次失败，重试中...[/yellow]"
             )
-            return None
-        raise
+
+    return None
 
 
-def _review_with_token_retry(greeting: str, job: dict, config: dict) -> dict | None:
-    """Keep greeting review from interrupting the usable generated draft."""
-    try:
-        return _review_greeting(greeting, job, config)
-    except AIRequestError as exc:
-        if exc.kind == "output_truncated":
-            _notify(config, f"{job['company']}｜{job['title']} 的质量检查回答被截断，正在增大输出 Token 上限后重试。")
-            retry_max_tokens = 600
-        elif exc.kind == "output_limit":
-            _notify(config, f"{job['company']}｜{job['title']} 正在降低单次输出 Token 上限后重试质量检查。")
-            retry_max_tokens = 128
-        elif exc.kind == "context_limit":
-            return None
-        else:
-            raise
-
-    try:
-        return _review_greeting(greeting, job, config, retry_max_tokens)
-    except AIRequestError as retry_exc:
-        if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
-            return None
-        raise
+def _review_with_retry(greeting: str, job: dict, config: dict) -> dict | None:
+    """自评，失败不阻塞流程。"""
+    for attempt in range(1, MAX_REVIEW_RETRIES + 1):
+        try:
+            result = _review_greeting(greeting, job, config, attempt=attempt)
+            if result:
+                return result
+        except AIRequestError as exc:
+            if exc.kind == "auth":
+                break
+            # 429 已在 _call_ai 内部等待过，继续重试
+        except Exception:
+            pass
+    return None
 
 
 def generate_greetings(config: dict) -> int:
-    """Generate greetings for approved jobs with optional self-review. Returns count generated."""
+    """
+    Generate greetings for approved jobs.
+    - AI 成功 → 使用 AI 招呼语
+    - AI 全部失败 → 使用默认招呼语 "您好"
+    - 无论哪种，状态都设为 "ready"（待发送）
+    Returns count processed.
+    """
     db = get_db()
     jobs = get_jobs_by_status(db, "approved")
+
     _workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
     if _workbench_job_ids:
         jobs = [job for job in jobs if str(job["id"]) in _workbench_job_ids]
 
     if not jobs:
-        console.print("[yellow]没有已确认的岗位可生成招呼语。请先运行 `bosshunter confirm`，或使用 `bosshunter run` 执行完整流程。[/yellow]")
+        console.print("[yellow]没有已确认的岗位可生成招呼语。[/yellow]")
         db.close()
         return 0
 
     resume_summary = _get_resume_summary(config)
     if not resume_summary:
-        console.print("[red]无法读取简历[/red]")
-        db.close()
-        return 0
+        console.print("[yellow]无法读取简历，将使用默认招呼语[/yellow]")
 
     ai_cfg = config.get("ai", {})
     review_threshold = ai_cfg.get("greeting_review_threshold", 7.0)
     try:
-        max_iterations = max(0, int(ai_cfg.get("greeting_max_iterations", 2) or 0))
+        max_iterations = max(0, int(ai_cfg.get("greeting_max_iterations", 4) or 0))
     except (TypeError, ValueError):
         max_iterations = 2
 
     count = 0
-    failed = 0
-    pause_reason = ""
+    fallback_count = 0
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        console=console
+        console=console,
     ) as progress:
         task = progress.add_task(f"生成招呼语 (0/{len(jobs)})", total=len(jobs))
 
         for index, job in enumerate(jobs, start=1):
-            best_greeting = None
-            pause_after_current = ""
+            progress.update(
+                task,
+                description=f"招呼语: {job['company'][:10]} - {job['title'][:15]} ({index}/{len(jobs)})",
+            )
 
-            for iteration in range(max_iterations + 1):
-                critique = ""
-                if iteration > 0 and best_greeting:
-                    try:
-                        review = _review_with_token_retry(best_greeting, job, config)
-                    except AIRequestError as exc:
-                        pause_after_current = exc.user_message
+            best_greeting: str | None = None
+
+            # ─── 有简历才尝试 AI 生成 ───────────────────────
+            if resume_summary:
+                for iteration in range(max_iterations + 1):
+                    critique = ""
+
+                    if iteration > 0 and best_greeting:
+                        review = _review_with_retry(best_greeting, job, config)
+                        if review and review.get("avg", 10) >= review_threshold:
+                            break
+                        critique = review.get("critique", "") if review else ""
+
+                    greeting = _generate_with_retry(job, resume_summary, config, critique)
+
+                    if not greeting:
+                        break  # 重试耗尽，跳出迭代
+
+                    best_greeting = greeting
+
+                    if max_iterations == 0:
                         break
-                    if review and review.get("avg", 10) >= review_threshold:
-                        break
-                    critique = review.get("critique", "") if review else ""
 
-                try:
-                    greeting = _generate_with_token_retry(job, resume_summary, config, critique)
-                except AIRequestError as exc:
-                    if best_greeting:
-                        pause_after_current = exc.user_message
-                    else:
-                        pause_reason = exc.user_message
-                    break
-
-                if not greeting:
-                    if not best_greeting:
-                        failed += 1
-                    break
-
-                best_greeting = greeting
-                if max_iterations == 0:
-                    break
-
+            # ─── 兜底：AI 全部失败 → 默认招呼语 ─────────────
             if not best_greeting:
-                progress.update(task, advance=1, description=f"生成招呼语 ({index}/{len(jobs)})")
-                if pause_reason:
-                    break
-                continue
+                best_greeting = DEFAULT_GREETING
+                fallback_count += 1
+                console.print(
+                    f"  [yellow]⚠ {job['company']}｜{job['title']} "
+                    f"AI生成失败，使用默认招呼语「{DEFAULT_GREETING}」[/yellow]"
+                )
 
+            # ─── 写入数据库，状态 → ready（待发送）───────────
             update_job_greeting(db, job["id"], best_greeting)
             update_job_status(db, job["id"], "ready")
             count += 1
-            progress.update(task, advance=1, description=f"生成招呼语 ({index}/{len(jobs)})")
+            progress.update(task, advance=1)
 
-            if pause_after_current:
-                pause_reason = pause_after_current
-                break
+            # 🆕 全局速率节流：每个岗位处理完后主动等待，避免连续请求触发RPM
+            if index < len(jobs):
+                jitter = random.uniform(0, 1.0)
+                sleep_time = GLOBAL_REQUEST_INTERVAL + jitter
+                console.print(f"[dim]💤 全局节流: 等待 {sleep_time:.1f}s 后处理下一个岗位[/dim]")
+                time.sleep(sleep_time)
 
     db.close()
-    if pause_reason:
-        remaining = max(len(jobs) - count, 0)
-        _notify(
-            config,
-            f"招呼语生成已安全暂停：{pause_reason}。已生成内容已保存，剩余 {remaining} 个岗位下次运行会继续处理。",
-            error=True,
-        )
-    if failed:
-        _notify(config, f"本轮有 {failed} 个岗位未生成招呼语并保留为待处理，可稍后重试。")
+
+    console.print(f"\n[green]✓ 招呼语生成完成：{count} 个岗位[/green]")
+    if fallback_count:
+        console.print(f"[yellow]  其中 {fallback_count} 个使用默认招呼语「{DEFAULT_GREETING}」[/yellow]")
+    console.print("[dim]  下一步：运行 bosshunter send 发送[/dim]")
+
     return count

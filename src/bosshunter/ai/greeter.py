@@ -164,10 +164,9 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
         else:
             kind = "unknown"
         raise AIRequestError(kind=kind, message=f"HTTP {status}: {body}") from exc
+    except AIRequestError:
+        raise
     except Exception as exc:
-        # 避免重复打印已在上面处理过的429日志
-        if isinstance(exc, AIRequestError) and exc.kind == "token_quota":
-            raise
         console.print(f"[red]❌ 请求异常: {type(exc).__name__}: {exc}[/red]")
         raise AIRequestError(kind="network", message=str(exc)) from exc
 
@@ -335,7 +334,7 @@ def generate_greetings(config: dict) -> int:
     Returns count processed.
     """
     db = get_db()
-    jobs = get_jobs_by_status(db, "approved")
+    jobs = get_jobs_by_status(db, "approved")          # ← 改这里：approved
 
     _workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
     if _workbench_job_ids:
@@ -389,7 +388,7 @@ def generate_greetings(config: dict) -> int:
                     greeting = _generate_with_retry(job, resume_summary, config, critique)
 
                     if not greeting:
-                        break  # 重试耗尽，跳出迭代
+                        break
 
                     best_greeting = greeting
 
@@ -407,11 +406,11 @@ def generate_greetings(config: dict) -> int:
 
             # ─── 写入数据库，状态 → ready（待发送）───────────
             update_job_greeting(db, job["id"], best_greeting)
-            update_job_status(db, job["id"], "ready")
+            update_job_status(db, job["id"], "ready")   # ← 改这里：ready
             count += 1
             progress.update(task, advance=1)
 
-            # 🆕 全局速率节流：每个岗位处理完后主动等待，避免连续请求触发RPM
+            # 全局速率节流
             if index < len(jobs):
                 jitter = random.uniform(0, 1.0)
                 sleep_time = GLOBAL_REQUEST_INTERVAL + jitter
@@ -423,6 +422,5 @@ def generate_greetings(config: dict) -> int:
     console.print(f"\n[green]✓ 招呼语生成完成：{count} 个岗位[/green]")
     if fallback_count:
         console.print(f"[yellow]  其中 {fallback_count} 个使用默认招呼语「{DEFAULT_GREETING}」[/yellow]")
-    console.print("[dim]  下一步：运行 bosshunter send 发送[/dim]")
 
     return count

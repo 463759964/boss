@@ -302,8 +302,7 @@ def score_jobs(config: dict) -> tuple[int, int]:
     console.print(f"\n[green]✓ 评分完成: {approved_count} approved / {filtered_count} filtered[/green]")
 
     # ═══════════════════════════════════════════════════════════
-    # 🆕 自动衔接：评分完成后立即生成招呼语
-    # ═══════════════════════════════════════════════════════════
+    # 自动衔接：评分 → 招呼语 → 发送
     if approved_count > 0:
         console.print("\n[bold cyan]━━━ 自动进入招呼语生成 ━━━[/bold cyan]\n")
         try:
@@ -312,7 +311,17 @@ def score_jobs(config: dict) -> tuple[int, int]:
         except Exception as exc:
             console.print(f"[red]招呼语生成阶段异常: {exc}[/red]")
             console.print("[yellow]可手动执行: bosshunter greet[/yellow]")
+            return approved_count, filtered_count
+
+        # ── 自动发送 ──────────────────────────────────────────
+        console.print("\n[bold cyan]━━━ 自动进入发送 ━━━[/bold cyan]\n")
+        try:
+            from bosshunter.executor.sender import send_greetings
+            send_greetings(config, force=True)
+        except Exception as exc:
+            console.print(f"[red]发送阶段异常: {exc}[/red]")
+            console.print("[yellow]可手动执行: bosshunter send[/yellow]")
     else:
-        console.print("[yellow]没有通过评分的岗位，跳过招呼语生成。[/yellow]")
+        console.print("[yellow]没有通过评分的岗位，跳过。[/yellow]")
 
     return approved_count, filtered_count

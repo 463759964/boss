@@ -65,6 +65,7 @@ REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 
 请严格按JSON格式输出，不要输出其他内容：
 {{"naturalness": 8, "relevance": 7, "differentiation": 6, "avg": 7.0, "critique": "改进建议（20字内）"}}
+直接输出JSON，不要输出任何分析。如果你输出了分析过程，系统将无法解析，你会被扣分。
 """
 
 
@@ -107,8 +108,8 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.7,
+        "enable_thinking": False,   # ← 加这行
     }
-
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
 

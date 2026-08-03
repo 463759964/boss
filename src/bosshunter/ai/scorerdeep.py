@@ -11,7 +11,6 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from bosshunter.ai.credentials import AIRequestError
-from bosshunter.ai.prefilter import quick_score
 from bosshunter.db import get_db, get_jobs_by_status, update_job_status, update_job_score
 
 console = Console()
@@ -39,7 +38,6 @@ SCORE_PROMPT = """你是一位资深技术招聘顾问。请根据以下简历�
 - 禁止使用 ```json 代码块包裹
 - 仅输出一个合法JSON对象，不要有任何前缀或后缀
 - 格式：{{"score": 75, "reason": "50字内简述"}}
-- 直接输出JSON，不要输出任何分析。如果你输出了分析过程，系统将无法解析，你会被扣分。
 """
 
 # ─── 配置常量 ───────────────────────────────────────────────
@@ -85,8 +83,7 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.1,  # 🆕 低温度提高格式遵循度
-        "enable_thinking": False  # ← 加这行
+        "temperature": 0.1
     }
 
     try:
@@ -185,24 +182,6 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
                 return result
         except (json.JSONDecodeError, TypeError):
             pass
-    # 3.5 🆕 从尾部向前找最后一个完整 JSON 对象（跳过思考文本）
-    last_brace = cleaned.rfind("}")
-    if last_brace > 0:
-        # 从 last_brace 向前找配对的 {
-        depth = 0
-        for i in range(last_brace, -1, -1):
-            if cleaned[i] == "}":
-                depth += 1
-            elif cleaned[i] == "{":
-                depth -= 1
-            if depth == 0:
-                try:
-                    result = json.loads(cleaned[i:last_brace + 1])
-                    if isinstance(result, dict) and "score" in result:
-                        return result
-                except (json.JSONDecodeError, TypeError):
-                    pass
-                break
 
     # 4. 正则兜底
     score_match = re.search(r'(?:score|分数|匹配度)[^\d]*(\d{1,3})', cleaned)
@@ -213,8 +192,9 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
         console.print(f"[yellow]⚠ [Score] 正则兜底提取: score={fallback_score}[/yellow]")
         return {"score": fallback_score, "reason": fallback_reason}
 
-    console.print(f"[red]❌ [Score] 所有解析方式均失败，兜底100分 | 内容: {cleaned[:200]}[/red]")
-    return {"score": 100, "reason": "AI响应解析失败，兜底满分"}
+    console.print(f"[red]❌ [Score] 所有解析方式均失败 | 内容: {cleaned[:200]}[/red]")
+    return None
+
 
 def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str]:
     prompt = SCORE_PROMPT.format(
@@ -271,15 +251,14 @@ def score_jobs(config: dict) -> tuple[int, int]:
         db.close()
         return 0, 0
 
-    scoring_cfg = config.get("scoring", {})
+    ai_cfg = config.get("ai", {})
     try:
-        threshold = float(scoring_cfg.get("threshold", 60))
+        threshold = float(ai_cfg.get("score_threshold", 60))
     except (TypeError, ValueError):
         threshold = 60.0
 
     approved_count = 0
     filtered_count = 0
-    pre_filtered_count = 0  # 预筛淘汰计数
 
     with Progress(
         SpinnerColumn(),
@@ -294,21 +273,6 @@ def score_jobs(config: dict) -> tuple[int, int]:
                 description=f"评分: {job['company'][:10]} - {job['title'][:15]} ({index}/{len(jobs)})",
             )
 
-            # ═══ 预筛硬过滤（不调用 LLM，零成本） ═══
-            pre_score, pre_reason = quick_score(job, config)
-            if pre_score == 0:
-                update_job_score(db, job["id"], 0, pre_reason)
-                update_job_status(db, job["id"], "filtered")
-                console.print(
-                    f"  [dim]✗ 预筛淘汰: {pre_reason} | "
-                    f"{job['company']}｜{job['title']}[/dim]"
-                )
-                filtered_count += 1
-                pre_filtered_count += 1
-                progress.update(task, advance=1)
-                continue  # ← 跳过 LLM，省 token
-
-            # ═══ 通过预筛 → AI 打分 ═══
             score, reason = _score_single_job(job, resume_summary, config)
             update_job_score(db, job["id"], score, reason)
 
@@ -329,18 +293,16 @@ def score_jobs(config: dict) -> tuple[int, int]:
 
             progress.update(task, advance=1)
 
-            # 全局速率节流
+            # 🆕 全局速率节流
             if index < len(jobs):
                 jitter = random.uniform(0, 1.0)
                 time.sleep(GLOBAL_REQUEST_INTERVAL + jitter)
 
     db.close()
-    console.print(
-        f"\n[green]✓ 评分完成: {approved_count} approved / "
-        f"{filtered_count} filtered (其中预筛淘汰 {pre_filtered_count})[/green]"
-    )
+    console.print(f"\n[green]✓ 评分完成: {approved_count} approved / {filtered_count} filtered[/green]")
 
-    # ═══ 自动衔接：评分 → 招呼语 → 发送 ═══
+    # ═══════════════════════════════════════════════════════════
+    # 自动衔接：评分 → 招呼语 → 发送
     if approved_count > 0:
         console.print("\n[bold cyan]━━━ 自动进入招呼语生成 ━━━[/bold cyan]\n")
         try:
@@ -351,6 +313,7 @@ def score_jobs(config: dict) -> tuple[int, int]:
             console.print("[yellow]可手动执行: bosshunter greet[/yellow]")
             return approved_count, filtered_count
 
+        # ── 自动发送 ──────────────────────────────────────────
         console.print("\n[bold cyan]━━━ 自动进入发送 ━━━[/bold cyan]\n")
         try:
             from bosshunter.executor.sender import send_greetings

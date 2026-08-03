@@ -34,11 +34,11 @@ throttle:
 ai:
   provider: openai_compatible
   service: custom
-  model: agnes-2.5-flash
+  model: deepseek-v4-flash
   greeting_review_threshold: 7
   greeting_max_iterations: 2
-  base_url: https://apihub.agnes-ai.com/v1
-  api_key: sk-e6ffPzEYl73RFCQ4MqU7ooDFSGmJ1avqvs0z4H8AEgZXeRoA
+  base_url: https://token.sensenova.cn/v1
+  api_key:  sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
 monitor:
   interval: 30
   chat_url: https://www.zhipin.com/web/geek/chat

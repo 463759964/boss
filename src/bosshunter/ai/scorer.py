@@ -216,6 +216,10 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
     console.print(f"[red]❌ [Score] 所有解析方式均失败，兜底100分 | 内容: {cleaned[:200]}[/red]")
     return {"score": 100, "reason": "AI响应解析失败，兜底满分"}
 
+
+import time  # 确保文件顶部导入了 time 模块
+
+
 def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str]:
     prompt = SCORE_PROMPT.format(
         resume_summary=resume_summary,
@@ -225,31 +229,79 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
         jd=(job.get("jd") or "")[:800],
     )
 
+    # 1. 正确获取嵌套在 scoring 下的及格线阈值
+    scoring_cfg = config.get("scoring", {})
+    threshold = float(scoring_cfg.get("threshold", 60))
+
+    # 用于记录第一次评分结果，以便在低分时进行二次评估
+    first_score: int | None = None
+    first_reason: str = ""
     last_error: Exception | None = None
 
-    for attempt in range(1, MAX_SCORE_RETRIES + 1):
-        console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
-        try:
-            result = _call_score_ai(prompt, config, attempt=attempt)
-            if result and isinstance(result.get("score"), (int, float)):
-                score = max(0, min(100, int(result["score"])))
-                reason = str(result.get("reason", ""))[:200]
-                return score, reason
-            last_error = ValueError(f"AI返回格式异常: {result}")
-        except AIRequestError as exc:
-            last_error = exc
-            if exc.kind == "auth":
-                console.print(f"[red]  AI 凭证问题，停止重试[/red]")
-                break
-            # token_quota 已在 _call_ai 内部等待过，继续下一次重试
-        except Exception as exc:
-            last_error = exc
+    # 最多进行两轮评分：第一轮正常评分，如果低分则触发第二轮
+    for eval_round in range(1, 3):
+        # 如果是第二轮，先暂停 2 秒，防止请求过快被 API 限流
+        if eval_round == 2:
+            console.print(f"[yellow]  ⏳ 二次评估前等待 2 秒，避免触发限流...[/yellow]")
+            time.sleep(2)
 
-        if attempt < MAX_SCORE_RETRIES:
-            console.print(f"[yellow]  评分第 {attempt} 次失败，重试中...[/yellow]")
+        last_error = None  # 每轮重置错误记录
 
+        # 原有的重试机制保持不变
+        for attempt in range(1, MAX_SCORE_RETRIES + 1):
+            console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
+            try:
+                result = _call_score_ai(prompt, config, attempt=attempt)
+
+                # 打印一下 AI 返回的原始数据，方便排查
+                console.print(f"[dim]   📥 AI原始返回: {result}[/dim]")
+
+                if result and isinstance(result.get("score"), (int, float)):
+                    score = max(0, min(100, int(result["score"])))
+                    reason = str(result.get("reason", ""))[:200]
+
+                    # === 核心逻辑：判断是否需要二次评估 ===
+                    # 如果是第一轮，且分数低于及格线，则记录结果并跳出重试循环，进入第二轮
+                    if eval_round == 1 and score < threshold:
+                        first_score = score
+                        first_reason = reason
+                        console.print(f"[yellow]  初次评分 {score} 低于阈值 {threshold}，准备触发二次评估...[/yellow]")
+                        break  # 跳出 attempt 循环，进入 eval_round 2
+
+                    # 如果是第二轮，计算两次分数的平均值
+                    if first_score is not None and eval_round == 2:
+                        avg_score = max(0, min(100, int(round((first_score + score) / 2))))
+                        combined_reason = (
+                            f"二次评估平均分。"
+                            f"第一次({first_score}分): {first_reason}；"
+                            f"第二次({score}分): {reason}"
+                        )[:200]  # 保持原有的 200 字符截断
+                        return avg_score, combined_reason
+                    else:
+                        # 第一轮直接达标，或不需要二次评估，直接返回
+                        return score, reason
+
+                # 如果没拿到有效分数，记录错误
+                last_error = ValueError(f"AI返回格式异常或缺少score: {result}")
+
+            except AIRequestError as exc:
+                last_error = exc
+                if exc.kind == "auth":
+                    console.print(f"[red]  ❌ AI 凭证问题，停止重试[/red]")
+                    return DEFAULT_SCORE_ON_FAILURE, f"AI凭证错误: {exc}"
+            except Exception as exc:
+                last_error = exc
+
+            if attempt < MAX_SCORE_RETRIES:
+                console.print(f"[yellow]  评分第 {attempt} 次失败，重试中...[/yellow]")
+
+        # 如果第一轮重试全部失败，直接走底部的全局兜底
+        if eval_round == 1 and first_score is None:
+            break
+
+            # 全局兜底：AI评分彻底失败
     console.print(
-        f"[red]  {job['company']}｜{job['title']} 评分失败，使用默认分数 {DEFAULT_SCORE_ON_FAILURE}[/red]"
+        f"[red]  ❌ {job['company']}｜{job['title']} 评分失败，使用默认分数 {DEFAULT_SCORE_ON_FAILURE}[/red]"
     )
     reason = f"AI评分失败（{type(last_error).__name__}），使用默认分数"
     return DEFAULT_SCORE_ON_FAILURE, reason

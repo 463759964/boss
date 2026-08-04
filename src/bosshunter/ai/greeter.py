@@ -1,6 +1,7 @@
 """AI Greeter - Generate personalized greeting messages with self-review and fallback."""
 
 import json
+import re
 import time
 import random
 from pathlib import Path
@@ -16,10 +17,74 @@ console = Console()
 
 # ─── 兜底与限流配置 ───────────────────────────────────────────────
 DEFAULT_GREETING = "您好"
-MAX_GENERATE_RETRIES = 3       # 单次生成最大重试
-MAX_REVIEW_RETRIES = 2         # 自评最大重试（失败不阻塞）
-GLOBAL_REQUEST_INTERVAL = 3.0  # 🆕 全局请求间隔(秒)，防止触碰RPM上限
+MAX_GENERATE_RETRIES = 3
+MAX_REVIEW_RETRIES = 2
+GLOBAL_REQUEST_INTERVAL = 3.0
 
+# ─── 思考内容清理（必须在 _call_ai 之前定义）─────────────────────
+_SYSTEM_PROMPT = (
+    "你是一个文本生成器。只输出最终文本本身。"
+    "严禁输出思考过程、任务复述、分析步骤、计划说明或任何元描述。"
+)
+
+_META_LINE_RE = re.compile(
+    r'^(?:'
+    r'我们(?:要求|需要|要|来|先|得)'
+    r'|(?:让我|我来|首先|接下来|下面)[，,]?'
+    r'|(?:用户|任务|需求|系统)(?:要求|需要|希望)'
+    r'|(?:好的|OK|ok)[，,。.！!]?\s*$'
+    r'|(?:以下是|下面是|这是)(?:生成|一条|一段|招呼)'
+    r'|根据(?:以上|上述|给定|提供的?)(?:信息|要求|条件|简历|岗位)'
+    r')'
+)
+
+
+def _is_meta_line(line: str) -> bool:
+    """判断一行是否属于思考/元描述，而非实际招呼语内容。"""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _META_LINE_RE.match(stripped):
+        return True
+    meta_kws = ('生成', '输出', '招呼语', '打招呼', '要求', '任务',
+                '让我', '我来', '首先', '分析', '编写', '写一')
+    if sum(1 for kw in meta_kws if kw in stripped) >= 2:
+        return True
+    return False
+
+
+def _clean_ai_output(text: str) -> str:
+    """清理 AI 输出中混入的思考标记和元描述。"""
+    if not text:
+        return ""
+
+    # 1) 移除  标签及内容
+    text = re.sub(r'', '', text, flags=re.DOTALL)
+
+    # 2) 移除 markdown 代码块包裹
+    text = re.sub(r'^```[^\n]*\n?', '', text.strip())
+    text = re.sub(r'\n?```\s*$', '', text.strip())
+    text = text.strip()
+
+    # 3) 逐行剥离开头的元描述（最多 5 行）
+    lines = text.split('\n')
+    start = 0
+    for i, line in enumerate(lines):
+        if i >= 5:
+            break
+        if not line.strip():
+            start = i + 1
+            continue
+        if _is_meta_line(line):
+            start = i + 1
+            continue
+        break
+
+    result = '\n'.join(lines[start:]).strip()
+    return result if result else text.strip()
+
+
+# ─── Prompt 模板 ─────────────────────────────────────────────────
 GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送打招呼消息。请根据以下信息生成一条个性化、自然的招呼语。
 
 ## 我的背景
@@ -47,7 +112,8 @@ GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送�
 9. 【严禁】不得把岗位JD中的描述（如公司头衔、项目名）当作我的经历来写
 10. 严格使用"我的背景"中的原文描述，不得改写或美化
 {critique_section}
-请直接输出招呼语文本，不要加任何标记或解释。
+
+【输出格式】直接输出招呼语文本本身。严禁输出思考过程、任务复述、分析步骤或任何解释说明。你的整条回复中只应包含最终的招呼语文字，不得包含任何其他内容。
 """
 
 REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
@@ -65,10 +131,12 @@ REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 
 请严格按JSON格式输出，不要输出其他内容：
 {{"naturalness": 8, "relevance": 7, "differentiation": 6, "avg": 7.0, "critique": "改进建议（20字内）"}}
-直接输出JSON，不要输出任何分析。如果你输出了分析过程，系统将无法解析，你会被扣分。
+
+【输出格式】只输出上述JSON，严禁输出任何思考过程、分析步骤或解释。
 """
 
 
+# ─── 工具函数 ─────────────────────────────────────────────────────
 def _get_resume_summary(config: dict) -> str:
     resume_path = Path(config.get("profile", {}).get("resume_path", "./resume.md"))
     if not resume_path.exists():
@@ -90,7 +158,6 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
     api_key = ai_cfg.get("api_key", "")
     model = ai_cfg.get("model", "")
 
-    # ─── 调试：打印实际使用的配置 ───────────────────────
     masked_key = f"{api_key[:8]}..." if len(api_key) > 8 else "(empty)"
     console.print(f"[dim]🔧 AI配置: model={model}, base_url={base_url}, key={masked_key}[/dim]")
 
@@ -105,20 +172,21 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
         "max_tokens": max_tokens,
         "temperature": 0.7,
-        "enable_thinking": False,   # ← 加这行
+        "enable_thinking": False,
     }
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
 
-        # ─── 调试：打印响应状态码和原始内容 ───────────────
         console.print(f"[dim]📡 HTTP {resp.status_code} | 响应长度: {len(resp.text)}[/dim]")
         if resp.status_code != 200:
             console.print(f"[red]❌ API错误响应: {resp.text[:500]}[/red]")
 
-        # 🆕 429 智能退避：不再立即抛异常，而是原地等待后重试
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
@@ -136,17 +204,17 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
         resp.raise_for_status()
         data = resp.json()
 
-        # ─── 调试：打印解析后的消息结构 ───────────────────
         choices = data.get("choices", [])
         if not choices:
             console.print(f"[red]❌ 响应中无 choices 字段: {str(data)[:300]}[/red]")
             return None
 
         msg = choices[0].get("message", {})
-        content = msg.get("content") or msg.get("reasoning_content") or msg.get("text") or ""
+        # ✅ 只取 content，不再 fallback 到 reasoning_content
+        content = msg.get("content") or ""
 
         if not content:
-            console.print(f"[yellow]⚠ AI返回空内容，完整message: {msg}[/yellow]")
+            console.print(f"[yellow]⚠ AI返回空content，完整message: {msg}[/yellow]")
             return None
 
         console.print(f"[dim]✅ AI返回成功，内容长度: {len(content)}[/dim]")
@@ -252,6 +320,12 @@ def _generate_greeting_once(
     if not greeting:
         return None
 
+    # ✅ 清理思考残留
+    greeting = _clean_ai_output(greeting)
+    if not greeting:
+        console.print("[yellow]⚠ AI输出经清理后为空（全是思考内容），视为失败[/yellow]")
+        return None
+
     greeting = greeting.strip('"\'')
     if len(greeting) > 150:
         cut = greeting[:150]
@@ -284,11 +358,9 @@ def _generate_with_retry(
         except AIRequestError as exc:
             last_error = exc
             if exc.kind in ("token_quota", "auth"):
-                # 🆕 429 已在 _call_ai 内部等待过，这里直接继续下一次重试
                 if exc.kind == "auth":
                     console.print(f"[red]  AI 凭证问题（{exc.kind}），停止重试[/red]")
                     break
-                # token_quota 不break，让循环继续（_call_ai已经sleep过了）
             if exc.kind == "context_limit" and attempt < MAX_GENERATE_RETRIES:
                 try:
                     result = _generate_greeting_once(
@@ -320,7 +392,6 @@ def _review_with_retry(greeting: str, job: dict, config: dict) -> dict | None:
         except AIRequestError as exc:
             if exc.kind == "auth":
                 break
-            # 429 已在 _call_ai 内部等待过，继续重试
         except Exception:
             pass
     return None
@@ -329,13 +400,10 @@ def _review_with_retry(greeting: str, job: dict, config: dict) -> dict | None:
 def generate_greetings(config: dict) -> int:
     """
     Generate greetings for approved jobs.
-    - AI 成功 → 使用 AI 招呼语
-    - AI 全部失败 → 使用默认招呼语 "您好"
-    - 无论哪种，状态都设为 "ready"（待发送）
     Returns count processed.
     """
     db = get_db()
-    jobs = get_jobs_by_status(db, "approved")          # ← 改这里：approved
+    jobs = get_jobs_by_status(db, "approved")
 
     _workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
     if _workbench_job_ids:
@@ -375,7 +443,6 @@ def generate_greetings(config: dict) -> int:
 
             best_greeting: str | None = None
 
-            # ─── 有简历才尝试 AI 生成 ───────────────────────
             if resume_summary:
                 for iteration in range(max_iterations + 1):
                     critique = ""
@@ -396,7 +463,6 @@ def generate_greetings(config: dict) -> int:
                     if max_iterations == 0:
                         break
 
-            # ─── 兜底：AI 全部失败 → 默认招呼语 ─────────────
             if not best_greeting:
                 best_greeting = DEFAULT_GREETING
                 fallback_count += 1
@@ -405,13 +471,11 @@ def generate_greetings(config: dict) -> int:
                     f"AI生成失败，使用默认招呼语「{DEFAULT_GREETING}」[/yellow]"
                 )
 
-            # ─── 写入数据库，状态 → ready（待发送）───────────
             update_job_greeting(db, job["id"], best_greeting)
-            update_job_status(db, job["id"], "ready")   # ← 改这里：ready
+            update_job_status(db, job["id"], "ready")
             count += 1
             progress.update(task, advance=1)
 
-            # 全局速率节流
             if index < len(jobs):
                 jitter = random.uniform(0, 1.0)
                 sleep_time = GLOBAL_REQUEST_INTERVAL + jitter

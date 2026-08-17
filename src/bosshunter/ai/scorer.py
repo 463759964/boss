@@ -43,7 +43,7 @@ SCORE_PROMPT = """你是一位资深技术招聘顾问。请根据以下简历�
 """
 
 # ─── 配置常量 ───────────────────────────────────────────────
-MAX_SCORE_RETRIES = 5
+MAX_SCORE_RETRIES = 2
 DEFAULT_SCORE_ON_FAILURE = 100
 RETRY_DELAY_SECONDS = 2
 GLOBAL_REQUEST_INTERVAL = 3.0  # 🆕 全局请求间隔(秒)，防止触碰RPM上限
@@ -86,7 +86,7 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.1,  # 🆕 低温度提高格式遵循度
-        "enable_thinking": False  # ← 加这行
+        "reasoning_effort": "none"  # ← 加这行
     }
 
     try:
@@ -231,7 +231,7 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
 
     # 1. 正确获取嵌套在 scoring 下的及格线阈值
     scoring_cfg = config.get("scoring", {})
-    threshold = float(scoring_cfg.get("threshold", 60))
+    threshold = float(scoring_cfg.get("threshold", 50))
 
     # 用于记录第一次评分结果，以便在低分时进行二次评估
     first_score: int | None = None

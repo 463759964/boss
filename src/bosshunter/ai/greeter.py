@@ -19,72 +19,14 @@ console = Console()
 DEFAULT_GREETING = "您好"
 MAX_GENERATE_RETRIES = 3
 MAX_REVIEW_RETRIES = 2
-GLOBAL_REQUEST_INTERVAL = 3.0
-
-# ─── 思考内容清理（必须在 _call_ai 之前定义）─────────────────────
-_SYSTEM_PROMPT = (
-    "你是一个文本生成器。只输出最终文本本身。"
-    "严禁输出思考过程、任务复述、分析步骤、计划说明或任何元描述。"
-)
-
-_META_LINE_RE = re.compile(
-    r'^(?:'
-    r'我们(?:要求|需要|要|来|先|得)'
-    r'|(?:让我|我来|首先|接下来|下面)[，,]?'
-    r'|(?:用户|任务|需求|系统)(?:要求|需要|希望)'
-    r'|(?:好的|OK|ok)[，,。.！!]?\s*$'
-    r'|(?:以下是|下面是|这是)(?:生成|一条|一段|招呼)'
-    r'|根据(?:以上|上述|给定|提供的?)(?:信息|要求|条件|简历|岗位)'
-    r')'
-)
-
-
-def _is_meta_line(line: str) -> bool:
-    """判断一行是否属于思考/元描述，而非实际招呼语内容。"""
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if _META_LINE_RE.match(stripped):
-        return True
-    meta_kws = ('生成', '输出', '招呼语', '打招呼', '要求', '任务',
-                '让我', '我来', '首先', '分析', '编写', '写一')
-    if sum(1 for kw in meta_kws if kw in stripped) >= 2:
-        return True
-    return False
-
-
-def _clean_ai_output(text: str) -> str:
-    """清理 AI 输出中混入的思考标记和元描述。"""
-    if not text:
-        return ""
-
-    # 1) 移除  标签及内容
-    text = re.sub(r'', '', text, flags=re.DOTALL)
-
-    # 2) 移除 markdown 代码块包裹
-    text = re.sub(r'^```[^\n]*\n?', '', text.strip())
-    text = re.sub(r'\n?```\s*$', '', text.strip())
-    text = text.strip()
-
-    # 3) 逐行剥离开头的元描述（最多 5 行）
-    lines = text.split('\n')
-    start = 0
-    for i, line in enumerate(lines):
-        if i >= 5:
-            break
-        if not line.strip():
-            start = i + 1
-            continue
-        if _is_meta_line(line):
-            start = i + 1
-            continue
-        break
-
-    result = '\n'.join(lines[start:]).strip()
-    return result if result else text.strip()
-
+# 优化: 全局节流从 3.0s 提升至 6.0s，适配 SenseNova RPM 限制，从源头减少 429 触发率
+GLOBAL_REQUEST_INTERVAL = 6.0
 
 # ─── Prompt 模板 ─────────────────────────────────────────────────
+# 优化: System Prompt 精简为纯指令，确保每次请求完全一致以最大化 Prompt Cache 命中率
+_SYSTEM_PROMPT = "你是一个文本生成器。只输出最终文本本身。严禁输出思考过程、任务复述、分析步骤、计划说明或任何元描述。"
+
+# 优化: 招呼语生成改为结构化 JSON 输出，彻底消除后处理清理逻辑和无效 token
 GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送打招呼消息。请根据以下信息生成一条个性化、自然的招呼语。
 
 ## 我的背景
@@ -113,9 +55,11 @@ GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送�
 10. 严格使用"我的背景"中的原文描述，不得改写或美化
 {critique_section}
 
-【输出格式】直接输出招呼语文本本身。严禁输出思考过程、任务复述、分析步骤或任何解释说明。你的整条回复中只应包含最终的招呼语文字，不得包含任何其他内容。
+【输出格式】请严格按以下JSON格式输出，不要输出任何其他内容：
+{{"greeting": "这里放最终的招呼语文本"}}
 """
 
+# 优化: Review Prompt 同样强制 JSON 输出，提升解析成功率
 REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 
 ## 岗位
@@ -129,10 +73,8 @@ REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 2. 相关性：是否针对该岗位突出匹配点
 3. 差异化：是否能从众多招呼中脱颖而出
 
-请严格按JSON格式输出，不要输出其他内容：
+请严格按以下JSON格式输出，不要输出其他内容：
 {{"naturalness": 8, "relevance": 7, "differentiation": 6, "avg": 7.0, "critique": "改进建议（20字内）"}}
-
-【输出格式】只输出上述JSON，严禁输出任何思考过程、分析步骤或解释。
 """
 
 
@@ -145,8 +87,14 @@ def _get_resume_summary(config: dict) -> str:
     return content[:1500]
 
 
-def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1) -> str | None:
-    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避）"""
+def _call_ai(
+    prompt: str,
+    config: dict,
+    max_tokens: int = 300,
+    attempt: int = 1,
+    json_mode: bool = False,
+) -> str | None:
+    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避与错误分类）"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
 
@@ -178,8 +126,12 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
         ],
         "max_tokens": max_tokens,
         "temperature": 0.7,
-        "enable_thinking": False,
+        "reasoning_effort": "none",
     }
+    # 优化: 启用 SenseNova JSON Mode，强制结构化输出
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
 
@@ -192,14 +144,15 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
             if retry_after:
                 wait_time = float(retry_after) + random.uniform(0.5, 1.5)
             else:
-                wait_time = min(60, 3 * (2 ** (attempt - 1))) + random.uniform(0, 2)
+                # 优化: RPM 退避基数从 3s 提升至 15s，避免反复撞击限流墙
+                wait_time = min(60, 15 * (2 ** (attempt - 1))) + random.uniform(0, 2)
 
             console.print(
                 f"[yellow]⏳ 触发RPM限流，等待 {wait_time:.1f}s 后重试 "
                 f"(第{attempt}/{MAX_GENERATE_RETRIES}次)[/yellow]"
             )
             time.sleep(wait_time)
-            raise AIRequestError(kind="token_quota", message=f"HTTP 429: RPM exhausted, waited {wait_time:.1f}s")
+            raise AIRequestError(kind="rate_limit", user_message=f"HTTP 429: RPM exhausted, waited {wait_time:.1f}s")
 
         resp.raise_for_status()
         data = resp.json()
@@ -210,7 +163,6 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
             return None
 
         msg = choices[0].get("message", {})
-        # ✅ 只取 content，不再 fallback 到 reasoning_content
         content = msg.get("content") or ""
 
         if not content:
@@ -224,20 +176,33 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 300, attempt: int = 1)
         status = exc.response.status_code
         body = exc.response.text[:500]
         console.print(f"[red]❌ HTTP {status}: {body}[/red]")
+
+        # 优化: 细化错误分类，400/404/insufficient_quota 标记为不可重试
+        err_data = {}
+        try:
+            err_data = exc.response.json().get("error", {})
+        except Exception:
+            pass
+        err_code = err_data.get("code", "")
+
         if status in (401, 403):
             kind = "auth"
+        elif status == 429 and err_code == "insufficient_quota":
+            kind = "non_retryable"
         elif status == 429:
-            kind = "token_quota"
+            kind = "rate_limit"
         elif status == 400 and "context" in body.lower():
             kind = "context_limit"
+        elif status in (400, 404):
+            kind = "non_retryable"
         else:
             kind = "unknown"
-        raise AIRequestError(kind=kind, message=f"HTTP {status}: {body}") from exc
+        raise AIRequestError(kind=kind, user_message=f"HTTP {status}: {body}") from exc
     except AIRequestError:
         raise
     except Exception as exc:
         console.print(f"[red]❌ 请求异常: {type(exc).__name__}: {exc}[/red]")
-        raise AIRequestError(kind="network", message=str(exc)) from exc
+        raise AIRequestError(kind="network", user_message=str(exc)) from exc
 
 
 def _truncate_prompt_text(text: str, limit: int) -> str:
@@ -269,7 +234,8 @@ def _review_greeting(
         company=job["company"],
         greeting=greeting,
     )
-    response = _call_ai(prompt, config, max_tokens, attempt=attempt)
+    # 优化: Review 同样启用 JSON Mode
+    response = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
     if not response:
         return None
     try:
@@ -316,14 +282,31 @@ def _generate_greeting_once(
         extra_highlights=_truncate_prompt_text(extra_highlights, 500),
     )
 
-    greeting = _call_ai(prompt, config, max_tokens, attempt=attempt)
-    if not greeting:
+    # 优化: 启用 JSON Mode 生成招呼语
+    greeting_raw = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
+    if not greeting_raw:
         return None
 
-    # ✅ 清理思考残留
-    greeting = _clean_ai_output(greeting)
+    # 优化: 直接解析 JSON，移除原有的正则清理逻辑
+    try:
+        data = json.loads(greeting_raw)
+        greeting = data.get("greeting", "").strip()
+    except (json.JSONDecodeError, TypeError):
+        console.print("[yellow]⚠ JSON解析失败，尝试提取纯文本兜底[/yellow]")
+        # 兜底: 如果 JSON 解析失败，仍尝试提取内容，保证功能不中断
+        start = greeting_raw.find("{")
+        end = greeting_raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(greeting_raw[start:end])
+                greeting = data.get("greeting", "").strip()
+            except Exception:
+                greeting = ""
+        else:
+            greeting = ""
+
     if not greeting:
-        console.print("[yellow]⚠ AI输出经清理后为空（全是思考内容），视为失败[/yellow]")
+        console.print("[yellow]⚠ AI输出经解析后为空，视为失败[/yellow]")
         return None
 
     greeting = greeting.strip('"\'')
@@ -357,10 +340,10 @@ def _generate_with_retry(
             last_error = ValueError("AI 返回空内容")
         except AIRequestError as exc:
             last_error = exc
-            if exc.kind in ("token_quota", "auth"):
-                if exc.kind == "auth":
-                    console.print(f"[red]  AI 凭证问题（{exc.kind}），停止重试[/red]")
-                    break
+            # 优化: 新增 non_retryable 类型，400/404/insufficient_quota 立即停止
+            if exc.kind in ("auth", "non_retryable"):
+                console.print(f"[red]  AI 请求不可重试（{exc.kind}），停止[/red]")
+                break
             if exc.kind == "context_limit" and attempt < MAX_GENERATE_RETRIES:
                 try:
                     result = _generate_greeting_once(
@@ -390,7 +373,7 @@ def _review_with_retry(greeting: str, job: dict, config: dict) -> dict | None:
             if result:
                 return result
         except AIRequestError as exc:
-            if exc.kind == "auth":
+            if exc.kind in ("auth", "non_retryable"):
                 break
         except Exception:
             pass

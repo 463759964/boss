@@ -35,18 +35,17 @@ SCORE_PROMPT = """你是一位资深技术招聘顾问。请根据以下简历�
 5. 发展空间（10%）
 
 ## ⚠️ 输出格式要求（严格遵守）
-- 禁止输出任何分析过程、解释文字或Markdown标记
-- 禁止使用 ```json 代码块包裹
-- 仅输出一个合法JSON对象，不要有任何前缀或后缀
+- 必须输出合法的 JSON 对象
 - 格式：{{"score": 75, "reason": "50字内简述"}}
-- 直接输出JSON，不要输出任何分析。如果你输出了分析过程，系统将无法解析，你会被扣分。
+- 禁止输出任何分析过程、解释文字或 Markdown 标记
 """
 
 # ─── 配置常量 ───────────────────────────────────────────────
-MAX_SCORE_RETRIES = 2
+MAX_SCORE_RETRIES = 3
 DEFAULT_SCORE_ON_FAILURE = 100
 RETRY_DELAY_SECONDS = 2
-GLOBAL_REQUEST_INTERVAL = 3.0  # 🆕 全局请求间隔(秒)，防止触碰RPM上限
+GLOBAL_REQUEST_INTERVAL = 3.0   # 全局请求间隔(秒)，防止触碰RPM上限
+MAX_RETRY_WAIT = 10.0           # 429 限流最大等待秒数
 
 
 def _get_resume_summary(config: dict) -> str:
@@ -81,12 +80,15 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
+    # 🆕 针对 DeepSeek V4 Flash 优化的 payload
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.1,  # 🆕 低温度提高格式遵循度
-        "reasoning_effort": "none"  # ← 加这行
+        "temperature": 0.1,
+        "reasoning_effort": "none",                  # 关闭思考模式，节省 token 和时间
+        "response_format": {"type": "json_object"}   # 启用原生 JSON 输出，杜绝格式问题
     }
 
     try:
@@ -94,15 +96,18 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
 
         console.print(f"[dim]📡 [Score] HTTP {resp.status_code} | 响应长度: {len(resp.text)}[/dim]")
 
-        # 🆕 429 智能退避
+        # 429 智能退避（带上限）
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
-                wait_time = float(retry_after) + random.uniform(0.5, 1.5)
+                wait_time = min(float(retry_after) + random.uniform(0.5, 1.5), MAX_RETRY_WAIT)
             else:
-                wait_time = min(60, 3 * (2 ** (attempt - 1))) + random.uniform(0, 2)
+                wait_time = min(
+                    3 * (2 ** (attempt - 1)) + random.uniform(0, 2),
+                    MAX_RETRY_WAIT
+                )
             console.print(
-                f"[yellow]⏳ [Score] 触发RPM限流，等待 {wait_time:.1f}s "
+                f"[yellow]⏳ [Score] 触发RPM/TPM限流，等待 {wait_time:.1f}s "
                 f"(第{attempt}/{MAX_SCORE_RETRIES}次)[/yellow]"
             )
             time.sleep(wait_time)
@@ -159,7 +164,7 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
 
     cleaned = response.strip()
 
-    # 1. 去除 Markdown 代码块
+    # 1. 去除 Markdown 代码块（虽然启用了 json_object，但保留作为安全网）
     if cleaned.startswith("```"):
         first_nl = cleaned.index("\n") if "\n" in cleaned else 3
         cleaned = cleaned[first_nl + 1:]
@@ -185,10 +190,10 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
                 return result
         except (json.JSONDecodeError, TypeError):
             pass
-    # 3.5 🆕 从尾部向前找最后一个完整 JSON 对象（跳过思考文本）
+
+    # 3.5 从尾部向前找最后一个完整 JSON 对象（跳过思考文本）
     last_brace = cleaned.rfind("}")
     if last_brace > 0:
-        # 从 last_brace 向前找配对的 {
         depth = 0
         for i in range(last_brace, -1, -1):
             if cleaned[i] == "}":
@@ -217,11 +222,8 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
     return {"score": 100, "reason": "AI响应解析失败，兜底满分"}
 
 
-import time  # 确保文件顶部导入了 time 模块
-
-
 def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str]:
-    prompt = SCORE_PROMPT.format(
+    base_prompt = SCORE_PROMPT.format(
         resume_summary=resume_summary,
         title=job["title"],
         company=job["company"],
@@ -229,7 +231,7 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
         jd=(job.get("jd") or "")[:800],
     )
 
-    # 1. 正确获取嵌套在 scoring 下的及格线阈值
+    # 正确获取嵌套在 scoring 下的及格线阈值
     scoring_cfg = config.get("scoring", {})
     threshold = float(scoring_cfg.get("threshold", 50))
 
@@ -240,16 +242,23 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
 
     # 最多进行两轮评分：第一轮正常评分，如果低分则触发第二轮
     for eval_round in range(1, 3):
-        # 如果是第二轮，先暂停 2 秒，防止请求过快被 API 限流
+        # 二次评估使用差异化 Prompt，避免 AI 返回相同结果
         if eval_round == 2:
+            prompt = base_prompt + (
+                "\n\n## ⚠️ 二次评估提醒\n"
+                "这是对该岗位的重新独立评估。请抛开先前可能存在的偏见，"
+                "重新审视简历与岗位的匹配度，给出你的独立判断。"
+            )
             console.print(f"[yellow]  ⏳ 二次评估前等待 2 秒，避免触发限流...[/yellow]")
             time.sleep(2)
+        else:
+            prompt = base_prompt
 
         last_error = None  # 每轮重置错误记录
 
         # 原有的重试机制保持不变
         for attempt in range(1, MAX_SCORE_RETRIES + 1):
-            console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
+            console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {eval_round} 轮第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
             try:
                 result = _call_score_ai(prompt, config, attempt=attempt)
 
@@ -261,7 +270,6 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                     reason = str(result.get("reason", ""))[:200]
 
                     # === 核心逻辑：判断是否需要二次评估 ===
-                    # 如果是第一轮，且分数低于及格线，则记录结果并跳出重试循环，进入第二轮
                     if eval_round == 1 and score < threshold:
                         first_score = score
                         first_reason = reason
@@ -275,10 +283,9 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                             f"二次评估平均分。"
                             f"第一次({first_score}分): {first_reason}；"
                             f"第二次({score}分): {reason}"
-                        )[:200]  # 保持原有的 200 字符截断
+                        )[:200]
                         return avg_score, combined_reason
                     else:
-                        # 第一轮直接达标，或不需要二次评估，直接返回
                         return score, reason
 
                 # 如果没拿到有效分数，记录错误
@@ -295,15 +302,16 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
             if attempt < MAX_SCORE_RETRIES:
                 console.print(f"[yellow]  评分第 {attempt} 次失败，重试中...[/yellow]")
 
-        # 如果第一轮重试全部失败，直接走底部的全局兜底
+        # 如果第一轮重试全部失败且未获得有效分数，跳出外层循环进入全局兜底
         if eval_round == 1 and first_score is None:
             break
 
-            # 全局兜底：AI评分彻底失败
+    # 全局兜底（仅当两轮都未返回有效结果时到达此处）
     console.print(
         f"[red]  ❌ {job['company']}｜{job['title']} 评分失败，使用默认分数 {DEFAULT_SCORE_ON_FAILURE}[/red]"
     )
-    reason = f"AI评分失败（{type(last_error).__name__}），使用默认分数"
+    error_type = type(last_error).__name__ if last_error else "unknown"
+    reason = f"AI评分失败（{error_type}），使用默认分数"
     return DEFAULT_SCORE_ON_FAILURE, reason
 
 
@@ -358,7 +366,7 @@ def score_jobs(config: dict) -> tuple[int, int]:
                 filtered_count += 1
                 pre_filtered_count += 1
                 progress.update(task, advance=1)
-                continue  # ← 跳过 LLM，省 token
+                continue  # 跳过 LLM，省 token
 
             # ═══ 通过预筛 → AI 打分 ═══
             score, reason = _score_single_job(job, resume_summary, config)

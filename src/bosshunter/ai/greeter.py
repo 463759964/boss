@@ -19,14 +19,13 @@ console = Console()
 DEFAULT_GREETING = "您好"
 MAX_GENERATE_RETRIES = 3
 MAX_REVIEW_RETRIES = 2
-# 优化: 全局节流从 3.0s 提升至 6.0s，适配 SenseNova RPM 限制，从源头减少 429 触发率
-GLOBAL_REQUEST_INTERVAL = 6.0
+GLOBAL_REQUEST_INTERVAL = 6.0   # 全局节流，适配 SenseNova RPM 限制
+MAX_RETRY_WAIT = 15.0           # 🆕 429 单次最大等待秒数，防止指数退避失控
+DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"  # 🆕 Review 失败时的兜底改进建议
 
 # ─── Prompt 模板 ─────────────────────────────────────────────────
-# 优化: System Prompt 精简为纯指令，确保每次请求完全一致以最大化 Prompt Cache 命中率
 _SYSTEM_PROMPT = "你是一个文本生成器。只输出最终文本本身。严禁输出思考过程、任务复述、分析步骤、计划说明或任何元描述。"
 
-# 优化: 招呼语生成改为结构化 JSON 输出，彻底消除后处理清理逻辑和无效 token
 GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送打招呼消息。请根据以下信息生成一条个性化、自然的招呼语。
 
 ## 我的背景
@@ -47,19 +46,17 @@ GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送�
 2. 风格自然，像真人发的IM消息，不要太正式
 3. 突出1-2个最匹配的优势
 4. 表达对岗位的兴趣，但不要谄媚
-5. 不要用"您好，我是xxx"这种模板开头，要有差异化
+5. 不要用"您好，我是xxx"这种模板开头，要有差异化，让hr有回复欲望
 6. 适配手机端阅读
-7. 在合适的位置自然带出作品集链接（不要每次都放，根据岗位匹配度决定）
-8. 【严禁】不得捏造我没有的经历、头衔或身份，只能使用"我的背景"中明确提到的信息
-9. 【严禁】不得把岗位JD中的描述（如公司头衔、项目名）当作我的经历来写
-10. 严格使用"我的背景"中的原文描述，不得改写或美化
+7. 【严禁】不得捏造我没有的经历、头衔或身份，只能使用"我的背景"中明确提到的信息
+8. 【严禁】不得把岗位JD中的描述（如公司头衔、项目名）当作我的经历来写
+9. 严格使用"我的背景"中的原文描述，不得改写或美化
 {critique_section}
 
 【输出格式】请严格按以下JSON格式输出，不要输出任何其他内容：
 {{"greeting": "这里放最终的招呼语文本"}}
 """
 
-# 优化: Review Prompt 同样强制 JSON 输出，提升解析成功率
 REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
 
 ## 岗位
@@ -128,7 +125,6 @@ def _call_ai(
         "temperature": 0.7,
         "reasoning_effort": "none",
     }
-    # 优化: 启用 SenseNova JSON Mode，强制结构化输出
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -139,13 +135,16 @@ def _call_ai(
         if resp.status_code != 200:
             console.print(f"[red]❌ API错误响应: {resp.text[:500]}[/red]")
 
+        # 🆕 429 退避增加上限保护
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
-                wait_time = float(retry_after) + random.uniform(0.5, 1.5)
+                wait_time = min(float(retry_after) + random.uniform(0.5, 1.5), MAX_RETRY_WAIT)
             else:
-                # 优化: RPM 退避基数从 3s 提升至 15s，避免反复撞击限流墙
-                wait_time = min(60, 15 * (2 ** (attempt - 1))) + random.uniform(0, 2)
+                wait_time = min(
+                    15 * (2 ** (attempt - 1)) + random.uniform(0, 2),
+                    MAX_RETRY_WAIT
+                )
 
             console.print(
                 f"[yellow]⏳ 触发RPM限流，等待 {wait_time:.1f}s 后重试 "
@@ -177,7 +176,6 @@ def _call_ai(
         body = exc.response.text[:500]
         console.print(f"[red]❌ HTTP {status}: {body}[/red]")
 
-        # 优化: 细化错误分类，400/404/insufficient_quota 标记为不可重试
         err_data = {}
         try:
             err_data = exc.response.json().get("error", {})
@@ -222,6 +220,38 @@ def _notify(config: dict, message: str, *, error: bool = False) -> None:
         callback(message)
 
 
+def _parse_json_response(response: str) -> dict | None:
+    """🆕 统一 JSON 解析：先直接解析，失败则花括号截取兜底"""
+    if not response:
+        return None
+    cleaned = response.strip()
+    # 去除可能的 Markdown 代码块
+    if cleaned.startswith("```"):
+        first_nl = cleaned.index("\n") if "\n" in cleaned else 3
+        cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+    # 直接解析
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # 花括号截取兜底
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            result = json.loads(cleaned[start:end])
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
 def _review_greeting(
     greeting: str,
     job: dict,
@@ -234,18 +264,8 @@ def _review_greeting(
         company=job["company"],
         greeting=greeting,
     )
-    # 优化: Review 同样启用 JSON Mode
     response = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
-    if not response:
-        return None
-    try:
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(response[start:end])
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+    return _parse_json_response(response)
 
 
 def _generate_greeting_once(
@@ -282,34 +302,22 @@ def _generate_greeting_once(
         extra_highlights=_truncate_prompt_text(extra_highlights, 500),
     )
 
-    # 优化: 启用 JSON Mode 生成招呼语
     greeting_raw = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
     if not greeting_raw:
         return None
 
-    # 优化: 直接解析 JSON，移除原有的正则清理逻辑
-    try:
-        data = json.loads(greeting_raw)
-        greeting = data.get("greeting", "").strip()
-    except (json.JSONDecodeError, TypeError):
-        console.print("[yellow]⚠ JSON解析失败，尝试提取纯文本兜底[/yellow]")
-        # 兜底: 如果 JSON 解析失败，仍尝试提取内容，保证功能不中断
-        start = greeting_raw.find("{")
-        end = greeting_raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                data = json.loads(greeting_raw[start:end])
-                greeting = data.get("greeting", "").strip()
-            except Exception:
-                greeting = ""
-        else:
-            greeting = ""
+    # 🆕 使用统一解析函数
+    data = _parse_json_response(greeting_raw)
+    if not data:
+        console.print("[yellow]⚠ JSON解析失败，视为生成失败[/yellow]")
+        return None
 
+    greeting = data.get("greeting", "").strip().strip('"\'')
     if not greeting:
         console.print("[yellow]⚠ AI输出经解析后为空，视为失败[/yellow]")
         return None
 
-    greeting = greeting.strip('"\'')
+    # 超长截断（保留句子完整性）
     if len(greeting) > 150:
         cut = greeting[:150]
         for sep in ("。", "！", "～", "！", "\n"):
@@ -340,7 +348,6 @@ def _generate_with_retry(
             last_error = ValueError("AI 返回空内容")
         except AIRequestError as exc:
             last_error = exc
-            # 优化: 新增 non_retryable 类型，400/404/insufficient_quota 立即停止
             if exc.kind in ("auth", "non_retryable"):
                 console.print(f"[red]  AI 请求不可重试（{exc.kind}），停止[/red]")
                 break
@@ -434,7 +441,8 @@ def generate_greetings(config: dict) -> int:
                         review = _review_with_retry(best_greeting, job, config)
                         if review and review.get("avg", 10) >= review_threshold:
                             break
-                        critique = review.get("critique", "") if review else ""
+                        # 🆕 Review 失败时使用兜底 critique，避免浪费迭代
+                        critique = review.get("critique", DEFAULT_CRITIQUE) if review else DEFAULT_CRITIQUE
 
                     greeting = _generate_with_retry(job, resume_summary, config, critique)
 

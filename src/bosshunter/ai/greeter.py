@@ -16,64 +16,54 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, updat
 console = Console()
 
 # ─── 兜底与限流配置 ───────────────────────────────────────────────
-DEFAULT_GREETING = "您好"
-MAX_GENERATE_RETRIES = 3
+DEFAULT_GREETING = ("[系统识别该候选人匹配度高]")
+MAX_GENERATE_RETRIES = 2
 MAX_REVIEW_RETRIES = 2
 GLOBAL_REQUEST_INTERVAL = 6.0   # 全局节流，适配 SenseNova RPM 限制
 MAX_RETRY_WAIT = 15.0           # 🆕 429 单次最大等待秒数，防止指数退避失控
 DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"  # 🆕 Review 失败时的兜底改进建议
 
-# ─── Prompt 模板 ─────────────────────────────────────────────────
-_SYSTEM_PROMPT = "你是一个文本生成器。只输出最终文本本身。严禁输出思考过程、任务复述、分析步骤、计划说明或任何元描述。"
+# ─── Prompt 模板（精简优化版）───────────────────────────────
+_SYSTEM_PROMPT = """你是文本生成器，只输出最终文本。严禁输出思考过程或元描述。每句话必须锚定用户真实素材，无信息增量的句子一律删除。禁止使用任何求职打招呼模板句式。"""
 
-GREETING_PROMPT = """你是一位求职者，需要在BOSS直聘上给HR发送打招呼消息。请根据以下信息生成一条个性化、自然的招呼语。
+GREETING_PROMPT = """你在BOSS直聘给HR发招呼语，目标是让对方愿意回复。
 
-## 我的背景
-{resume_summary}
+## 输入
+- 我的背景（仅可从此取信息，严禁捏造/改写）：{resume_summary}
+- 岗位：{title} @ {company} | 薪资：{salary}
+- JD摘要（内容锚点，必须优先响应）：{jd_summary}
+- 匹配点（JD要求与我的经历的对应关系）：{match_reason}
+- 额外亮点（自然融入，不罗列）：{extra_highlights}
 
-## 目标岗位
-- 职位：{title}
-- 公司：{company}
-- 薪资：{salary}
-- 岗位要求摘要：{jd_summary}
-- 匹配分析：{match_reason}
+## 创作规则
+1. 风格：真人IM口语化，轻松自然，可用语气词但不卖萌。不要公文体/邮件感/AI客服感。
+2. 开头：首句必须含JD中的核心关键词（技术栈/业务场景/项目类型），并用我的真实经历直接回应。禁止"您好我是""看到贵司招聘""眼睛一亮"等所有模板开头。
+3. 内容：只突出1-2个与JD强相关的匹配优势；每提一个自身经历，必须能对应到JD中的具体要求；不谄媚；严禁把JD内容当作我的经历。
+4. 结尾：必须陈述句收尾，且提供与JD相关的信息增量（如补充JD关注点的成果/匹配细节）。禁止问句、邀约、客套话（"方便聊聊""期待沟通""盼回复"等）。
+5. 格式：50-146字，短句为主，适当换行，无Markdown/列表符号。
 
-## 额外亮点（适时融入，不要生硬罗列）
-{extra_highlights}
-
-## 要求
-1. 字数控制在50-150字
-2. 风格自然，像真人发的IM消息，不要太正式
-3. 突出1-2个最匹配的优势
-4. 表达对岗位的兴趣，但不要谄媚
-5. 不要用"您好，我是xxx"这种模板开头，要有差异化，让hr有回复欲望
-6. 适配手机端阅读
-7. 【严禁】不得捏造我没有的经历、头衔或身份，只能使用"我的背景"中明确提到的信息
-8. 【严禁】不得把岗位JD中的描述（如公司头衔、项目名）当作我的经历来写
-9. 严格使用"我的背景"中的原文描述，不得改写或美化
 {critique_section}
 
-【输出格式】请严格按以下JSON格式输出，不要输出任何其他内容：
-{{"greeting": "这里放最终的招呼语文本"}}
-"""
+## 输出
+以纯JSON对象返回，key为"greeting"，value为招呼语文本。不要包含markdown代码块标记。"""
 
-REVIEW_PROMPT = """请评估以下BOSS直聘招呼语的质量。
+REVIEW_PROMPT = """评估BOSS直聘招呼语质量。
 
-## 岗位
-{title} @ {company}
+## 输入
+- 岗位：{title} @ {company}
+- 招呼语：{greeting}
 
-## 招呼语
-{greeting}
+## 评分（每项1-10分）
+1. 去模板化：首句有具体名词/数据？避开所有套话及新型模板？结尾为陈述句且无问句/邀约/客套？
+2. 自然度：像真人IM消息，略微口语化、无公文/AI感？
+3. 相关性：针对岗位突出1-2个匹配点，不泛泛而谈？
+4. 真实性：仅用候选人真实背景，无捏造？
+5. 可读性：短句为主，适配手机阅读？
 
-## 评估维度（每项1-10分）
-1. 自然度：是否像真人发的IM消息，而非模板
-2. 相关性：是否针对该岗位突出匹配点
-3. 差异化：是否能从众多招呼中脱颖而出
+若第1项<7分，critique须指出具体套话/问题结尾，并给出基于真实素材的陈述句改写方向（20字内）。
 
-请严格按以下JSON格式输出，不要输出其他内容：
-{{"naturalness": 8, "relevance": 7, "differentiation": 6, "avg": 7.0, "critique": "改进建议（20字内）"}}
-"""
-
+## 输出
+以纯JSON对象返回，包含de_template,naturalness,relevance,authenticity,readability,avg,critique字段。不要包含markdown代码块标记。"""
 
 # ─── 工具函数 ─────────────────────────────────────────────────────
 def _get_resume_summary(config: dict) -> str:
@@ -449,6 +439,7 @@ def generate_greetings(config: dict) -> int:
                     if not greeting:
                         break
 
+                    # best_greeting = f"{DEFAULT_GREETING}{greeting}"
                     best_greeting = greeting
 
                     if max_iterations == 0:
@@ -466,7 +457,7 @@ def generate_greetings(config: dict) -> int:
             update_job_status(db, job["id"], "ready")
             count += 1
             progress.update(task, advance=1)
-
+            print(best_greeting)
             if index < len(jobs):
                 jitter = random.uniform(0, 1.0)
                 sleep_time = GLOBAL_REQUEST_INTERVAL + jitter

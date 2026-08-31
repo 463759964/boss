@@ -4,6 +4,7 @@ import json
 import re
 import time
 import random
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -22,10 +23,15 @@ SYSTEM_PROMPT = (
     "【输出强制约束】\n"
     "1. 必须且只能输出合法的JSON对象\n"
     "2. 格式严格为：{\"score\": int(0-100), \"reason\": \"50字内简述\"}\n"
-    "3. 禁止输出任何思考过程、分析文字、Markdown标记或额外字段"
+    "3. 禁止输出任何思考过程、分析文字、Markdown标记或额外字段\n"
+    "4. reason中涉及候选人身份时，必须基于【当前时间】计算毕业时长，"
+    "使用'X届，已毕业Y年'格式，严禁对非当年毕业生使用'应届生'标签"
 )
 
-USER_PROMPT_TEMPLATE = """## 简历摘要
+USER_PROMPT_TEMPLATE = """## 当前时间
+{current_date}
+
+## 简历摘要
 {resume_summary}
 
 ## 岗位信息
@@ -41,14 +47,21 @@ USER_PROMPT_TEMPLATE = """## 简历摘要
 4. 薪资匹配度（10%）
 5. 发展空间（10%）
 
+⚠ 重要：当前是{current_year}年，若候选人毕业于{current_year}年之前，
+禁止使用"应届生"标签，应根据实际毕业年份描述（如"25届，已毕业1年"）。
+
 请根据上述信息评估匹配程度。"""
 
 RE_EVAL_PROMPT_TEMPLATE = """## 二次独立评估请求
+当前时间：{current_date}
 上一轮你对该岗位的评分为 {first_score} 分，理由：{first_reason}
 请抛开先前判断，仅基于以下核心信息重新独立评估：
 - 职位：{title} @ {company}
 - 简历关键匹配点：{resume_snippet}
 - JD核心要求：{jd_snippet}
+
+⚠ 重申：当前是{current_year}年，请基于此时间判断候选人毕业时长，
+严禁对非当年毕业生使用"应届生"标签。
 
 请重新给出你的独立判断。"""
 
@@ -56,7 +69,7 @@ RE_EVAL_PROMPT_TEMPLATE = """## 二次独立评估请求
 # ─── 配置常量 ───────────────────────────────────────────────
 MAX_SCORE_RETRIES = 3
 GLOBAL_REQUEST_INTERVAL = 3.0   # 全局请求间隔(秒)，防止触碰RPM上限
-MAX_RETRY_WAIT = 10.0           # 429 限流最大等待秒数
+MAX_RETRY_WAIT = 15.0           # 429 限流最大等待秒数
 AI_MAX_TOKENS = 150             # 评分JSON极短，150 tokens足够冗余
 
 
@@ -75,15 +88,36 @@ class RateLimiter:
         self._last_call = time.monotonic()
 
 
+# ★ 全局限流器实例（在模块级别初始化，供 _call_ai 使用）
+_limiter = RateLimiter(GLOBAL_REQUEST_INTERVAL)
+
+
 def _get_resume_summary(config: dict) -> str:
     resume_path = Path(config.get("profile", {}).get("resume_path", "./resume.md"))
     if not resume_path.exists():
         return ""
-    return resume_path.read_text(encoding="utf-8")[:2000]
+    text = resume_path.read_text(encoding="utf-8")
+
+    # ★ 优先提取头部 + 教育经历段落，确保毕业年份不被截断丢失
+    head = text[:300]
+    edu_section = ""
+    for keyword in ["教育背景", "教育经历", "Education"]:
+        idx = text.find(keyword)
+        if idx != -1:
+            edu_section = text[idx:idx + 500]
+            break
+
+    summary = f"{head}\n\n{edu_section}".strip()
+    # 兜底：如果提取后仍不足2000字，补充剩余内容
+    if len(summary) < 2000:
+        remaining = text[len(summary):]
+        summary += "\n" + remaining[:2000 - len(summary)]
+
+    return summary[:2000]
 
 
 def _call_ai(messages: list[dict], config: dict, max_tokens: int = AI_MAX_TOKENS, attempt: int = 1) -> str | None:
-    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避与缓存监控）"""
+    """根据 config.ai 配置调用 OpenAI 兼容模型（含请求级限流、TPM/RPM区分退避、finish_reason防御）"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
 
@@ -107,41 +141,57 @@ def _call_ai(messages: list[dict], config: dict, max_tokens: int = AI_MAX_TOKENS
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-
-    # 针对 DeepSeek V4 Flash 优化的 payload
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.1,
-        "reasoning_effort": "none",                  # 关闭思考模式，节省 token 和时间
-        "response_format": {"type": "json_object"}   # 启用原生 JSON 输出
+        "reasoning_effort": "none",
+        "response_format": {"type": "json_object"},
     }
+
+    # ★ 请求级滑动窗口限流：每次 API 调用前等待
+    _limiter.wait()
 
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
 
         console.print(f"[dim]📡 [Score] HTTP {resp.status_code} | 响应长度: {len(resp.text)}[/dim]")
+        if resp.status_code != 200:
+            console.print(f"[red]❌ [Score] API错误响应: {resp.text[:500]}[/red]")
 
-        # 429 智能退避（带上限）
+        # ★ 429 退避：区分 TPM / RPM 限流类型
         if resp.status_code == 429:
+            err_body = {}
+            try:
+                err_body = resp.json().get("error", {})
+            except Exception:
+                pass
+            err_code = str(err_body.get("code", ""))
+            err_msg = str(err_body.get("message", ""))
+
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 wait_time = min(float(retry_after) + random.uniform(0.5, 1.5), MAX_RETRY_WAIT)
+                console.print(
+                    f"[yellow]⏳ [Score] 服务端指定Retry-After，等待 {wait_time:.1f}s 后重试 "
+                    f"(第{attempt}次)[/yellow]"
+                )
+            elif "tpm" in err_code.lower() or "tpm" in err_msg.lower():
+                wait_time = min(3.0 + random.uniform(0, 2), MAX_RETRY_WAIT)
+                console.print(f"[yellow]⏳ [Score] TPM限流({err_code})，短等待 {wait_time:.1f}s[/yellow]")
             else:
                 wait_time = min(
-                    3 * (2 ** (attempt - 1)) + random.uniform(0, 2),
+                    15 * (2 ** (attempt - 1)) + random.uniform(0, 2),
                     MAX_RETRY_WAIT
                 )
-            console.print(
-                f"[yellow]⏳ [Score] 触发RPM/TPM限流，等待 {wait_time:.1f}s "
-                f"(第{attempt}/{MAX_SCORE_RETRIES}次)[/yellow]"
-            )
-            time.sleep(wait_time)
-            raise AIRequestError(kind="token_quota", message=f"HTTP 429: waited {wait_time:.1f}s")
+                console.print(
+                    f"[yellow]⏳ [Score] RPM限流，等待 {wait_time:.1f}s 后重试 "
+                    f"(第{attempt}次)[/yellow]"
+                )
 
-        if resp.status_code != 200:
-            console.print(f"[red]❌ [Score] API错误响应: {resp.text[:500]}[/red]")
+            time.sleep(wait_time)
+            raise AIRequestError(kind="rate_limit", message=f"HTTP 429: {err_code or 'rate_limited'}, waited {wait_time:.1f}s")
 
         resp.raise_for_status()
         data = resp.json()
@@ -162,7 +212,7 @@ def _call_ai(messages: list[dict], config: dict, max_tokens: int = AI_MAX_TOKENS
         msg = choice.get("message", {})
         finish_reason = choice.get("finish_reason")
 
-        # 防御性检查：合规拦截或截断
+        # ★ finish_reason 防御
         if finish_reason == "content_filter":
             console.print(f"[yellow]⚠ [Score] 内容被合规审核拦截，跳过[/yellow]")
             return None
@@ -182,17 +232,29 @@ def _call_ai(messages: list[dict], config: dict, max_tokens: int = AI_MAX_TOKENS
         status = exc.response.status_code
         body = exc.response.text[:500]
         console.print(f"[red]❌ [Score] HTTP {status}: {body}[/red]")
+
+        err_data = {}
+        try:
+            err_data = exc.response.json().get("error", {})
+        except Exception:
+            pass
+        err_code = err_data.get("code", "")
+
         if status in (401, 403):
             kind = "auth"
+        elif status == 429 and err_code == "insufficient_quota":
+            kind = "non_retryable"
         elif status == 429:
-            kind = "token_quota"
+            kind = "rate_limit"
         elif status == 400 and "context" in body.lower():
             kind = "context_limit"
+        elif status in (400, 404):
+            kind = "non_retryable"
         else:
             kind = "unknown"
         raise AIRequestError(kind=kind, message=f"HTTP {status}: {body}") from exc
     except AIRequestError:
-        raise  # 429 已在上面处理过，直接透传
+        raise
     except Exception as exc:
         console.print(f"[red]❌ [Score] 请求异常: {type(exc).__name__}: {exc}[/red]")
         raise AIRequestError(kind="network", message=str(exc)) from exc
@@ -258,7 +320,6 @@ def _call_score_ai(messages: list[dict], config: dict, attempt: int = 1) -> dict
     reason_match = re.search(r'(?:reason|原因|总结)[：:]\s*(.{10,80})', cleaned)
     if score_match:
         raw_score = int(score_match.group(1))
-        # 校验：分数必须在 0-100 且 reason 长度合理
         if 0 <= raw_score <= 100 and reason_match and len(reason_match.group(1).strip()) >= 5:
             fallback_reason = reason_match.group(1).strip()
             console.print(f"[yellow]⚠ [Score] 正则兜底提取: score={raw_score}[/yellow]")
@@ -266,19 +327,24 @@ def _call_score_ai(messages: list[dict], config: dict, attempt: int = 1) -> dict
         else:
             console.print(f"[yellow]⚠ [Score] 正则提取值异常(score={raw_score})，视为解析失败[/yellow]")
 
-    # 解析彻底失败 → 返回 None
     console.print(f"[red]❌ [Score] 所有解析方式均失败，跳过该岗位 | 内容: {cleaned[:200]}[/red]")
     return None
 
 
-def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str, str | None]:
+def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int | None, str | None, str | None]:
     """
-    对单个岗位进行AI评分。
+    对单个岗位进行AI评分（Best-of-2 + 早停策略）。
     返回: (score, reason, error_kind)
     - 成功时: (score, reason, None)
-    - 失败时: (None, None, error_kind)  # error_kind 为 "auth", "network" 等，用于外层熔断
+    - 失败时: (None, None, error_kind)
     """
+    now = datetime.now()
+    current_date = now.strftime("%Y年%m月%d日")
+    current_year = now.year
+
     base_user_prompt = USER_PROMPT_TEMPLATE.format(
+        current_date=current_date,
+        current_year=current_year,
         resume_summary=resume_summary,
         title=job["title"],
         company=job["company"],
@@ -289,17 +355,19 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
     scoring_cfg = config.get("scoring", {})
     threshold = float(scoring_cfg.get("threshold", 50))
 
-    first_score: int | None = None
-    first_reason: str = ""
+    best_score: int | None = None
+    best_reason: str = ""
     last_error_kind: str | None = None
 
-    # 最多进行两轮评分：第一轮正常评分，如果低分则触发第二轮
+    # ★ Best-of-2 + 早停：最多两轮评估，任一轮 ≥ threshold 即通过
     for eval_round in range(1, 3):
-        # 构造 messages (System 保持不变以命中缓存，User 动态变化)
+        # 构造 messages
         if eval_round == 2:
             user_prompt = RE_EVAL_PROMPT_TEMPLATE.format(
-                first_score=first_score,
-                first_reason=first_reason,
+                current_date=current_date,
+                current_year=current_year,
+                first_score=best_score,
+                first_reason=best_reason,
                 title=job["title"],
                 company=job["company"],
                 resume_snippet=resume_summary[:300],
@@ -315,7 +383,7 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
             {"role": "user", "content": user_prompt}
         ]
 
-        last_error_kind = None  # 每轮重置错误记录
+        last_error_kind = None
 
         for attempt in range(1, MAX_SCORE_RETRIES + 1):
             console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {eval_round} 轮第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
@@ -328,24 +396,19 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                     score = max(0, min(100, int(result["score"])))
                     reason = str(result.get("reason", ""))[:200]
 
-                    # 核心逻辑：判断是否需要二次评估
-                    if eval_round == 1 and score < threshold:
-                        first_score = score
-                        first_reason = reason
-                        console.print(f"[yellow]  初次评分 {score} 低于阈值 {threshold}，准备触发二次评估...[/yellow]")
-                        break  # 跳出 attempt 循环，进入 eval_round 2
+                    # ★ 记录历史最高分（兜底用）
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_reason = reason
 
-                    # 如果是第二轮，计算两次分数的平均值
-                    if first_score is not None and eval_round == 2:
-                        avg_score = max(0, min(100, int(round((first_score + score) / 2))))
-                        combined_reason = (
-                            f"二次评估平均分。"
-                            f"第一次({first_score}分): {first_reason}；"
-                            f"第二次({score}分): {reason}"
-                        )[:200]
-                        return avg_score, combined_reason, None
-                    else:
+                    # ★ 达标即通过，立即终止后续所有评估
+                    if score >= threshold:
+                        console.print(f"[green]  ✅ 第{eval_round}轮评分 {score} ≥ 阈值 {threshold}，直接通过[/green]")
                         return score, reason, None
+
+                    # 未达标但获得了有效分数，跳出 attempt 循环进入下一轮
+                    console.print(f"[yellow]  第{eval_round}轮评分 {score} < 阈值 {threshold}，准备下一轮评估...[/yellow]")
+                    break
 
                 # AI返回了但缺少有效score字段
                 last_error_kind = "parse_error"
@@ -354,7 +417,7 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                 last_error_kind = exc.kind
                 if exc.kind == "auth":
                     console.print(f"[red]  ❌ AI 凭证问题，停止重试[/red]")
-                    return None, None, "auth"  # 凭证错误直接返回，触发全局熔断
+                    return None, None, "auth"
             except Exception as exc:
                 last_error_kind = "unknown"
 
@@ -362,10 +425,17 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                 console.print(f"[yellow]  评分第 {attempt} 次失败，重试中...[/yellow]")
 
         # 第一轮重试全部失败且未获得有效分数，跳出外层循环
-        if eval_round == 1 and first_score is None:
+        if eval_round == 1 and best_score is None:
             break
 
-    # 两轮都失败时返回 None，由上层决定跳过
+    # ★ 两轮均未达标，返回最高分候选（由上层决定是否 filtered）
+    if best_score is not None:
+        console.print(
+            f"[yellow]  ⚠ {job['company']}｜{job['title']} 两轮均未达标，"
+            f"使用最高分 {best_score}[/yellow]"
+        )
+        return best_score, best_reason, None
+
     console.print(
         f"[yellow]  ⏭ {job['company']}｜{job['title']} 评分失败({last_error_kind})，跳过，下次再评[/yellow]"
     )
@@ -399,9 +469,6 @@ def score_jobs(config: dict) -> tuple[int, int]:
     pre_filtered_count = 0
     skipped_count = 0
 
-    # 初始化滑动窗口限流器
-    limiter = RateLimiter(GLOBAL_REQUEST_INTERVAL)
-
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -410,7 +477,6 @@ def score_jobs(config: dict) -> tuple[int, int]:
         task = progress.add_task(f"AI 评分 (0/{len(jobs)})", total=len(jobs))
 
         for index, job in enumerate(jobs, start=1):
-            # 更新进度条（嵌入实时统计）
             progress.update(
                 task,
                 description=(
@@ -437,15 +503,14 @@ def score_jobs(config: dict) -> tuple[int, int]:
                 continue
 
             # ═══ 通过预筛 → AI 打分 ═══
-            limiter.wait()  # 精确控制请求间隔
             score, reason, error_kind = _score_single_job(job, resume_summary, config)
 
-            # ★ 凭证熔断：检测到 auth 错误立即终止整个流程
+            # ★ 凭证熔断
             if error_kind == "auth":
                 console.print("[red]🛑 检测到AI凭证错误，立即终止评分流程！请检查 config.yaml[/red]")
                 break
 
-            # ★ 失败跳过：保持 pending 状态，下次再评
+            # ★ 失败跳过
             if score is None:
                 skipped_count += 1
                 console.print(

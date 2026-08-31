@@ -16,15 +16,41 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, updat
 console = Console()
 
 # ─── 兜底与限流配置 ───────────────────────────────────────────────
-DEFAULT_GREETING = ("[系统识别该候选人匹配度高]")
+DEFAULT_GREETING = "[系统识别该候选人匹配度高]"
 MAX_GENERATE_RETRIES = 2
 MAX_REVIEW_RETRIES = 2
-GLOBAL_REQUEST_INTERVAL = 6.0   # 全局节流，适配 SenseNova RPM 限制
-MAX_RETRY_WAIT = 15.0           # 🆕 429 单次最大等待秒数，防止指数退避失控
-DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"  # 🆕 Review 失败时的兜底改进建议
+GLOBAL_REQUEST_INTERVAL = 4.0
+MAX_RETRY_WAIT = 15.0           # 429 单次最大等待秒数
+DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"
+AI_MAX_GENERATE_TOKENS = 300
+AI_MAX_REVIEW_TOKENS = 120      # Review 精简输出，120 tokens 足够
 
-# ─── Prompt 模板（精简优化版）───────────────────────────────
-_SYSTEM_PROMPT = """你是文本生成器，只输出最终文本。严禁输出思考过程或元描述。每句话必须锚定用户真实素材，无信息增量的句子一律删除。禁止使用任何求职打招呼模板句式。"""
+
+class RateLimiter:
+    """简易滑动窗口限流器，精确控制请求间隔"""
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._last_call = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        elapsed = now - self._last_call
+        if elapsed < self.interval:
+            sleep_time = self.interval - elapsed + random.uniform(0, 0.3)
+            time.sleep(sleep_time)
+        self._last_call = time.monotonic()
+
+
+# 全局限流器实例
+_limiter = RateLimiter(GLOBAL_REQUEST_INTERVAL)
+
+
+# ─── Prompt 模板 ───────────────────────────────────────────────────
+_SYSTEM_PROMPT = (
+    "你是文本生成器，只输出最终文本。严禁输出思考过程或元描述。"
+    "每句话必须锚定用户真实素材，无信息增量的句子一律删除。"
+    "禁止使用任何求职打招呼模板句式。"
+)
 
 GREETING_PROMPT = """你在BOSS直聘给HR发招呼语，目标是让对方愿意回复。
 
@@ -37,12 +63,13 @@ GREETING_PROMPT = """你在BOSS直聘给HR发招呼语，目标是让对方愿�
 
 ## 创作规则
 1. 风格：真人IM口语化，轻松自然，可用语气词但不卖萌。不要公文体/邮件感/AI客服感。
-2. 开头：首句必须含JD中的核心关键词（技术栈/业务场景/项目类型），并用我的真实经历直接回应。禁止"您好我是""看到XX""眼睛一亮"等所有模板开头。
+2. 开头：首句必须以JD核心关键词（技术栈/业务场景/项目类型）起笔，紧跟我的真实经历作为主语直接衔接。
+   ✅ 正确范式："你们JD提到的{jd_keyword}，我在{real_project}中负责过{specific_task}"
+   ✅ 正确范式："{jd_keyword}这块我比较熟，之前在{company_or_project}做过{concrete_result}"
+   ❌ 错误范式：以"您好""看到""注意到""对...感兴趣"等人称代词或感知动词起笔
 3. 内容：只突出1-2个与JD强相关的匹配优势；每提一个自身经历，必须能对应到JD中的具体要求；不谄媚；严禁把JD内容当作我的经历。
 4. 结尾：必须陈述句收尾，且提供与JD相关的信息增量（如补充JD关注点的成果/匹配细节）。禁止问句、邀约、客套话（"方便聊聊""期待沟通""盼回复"等）。
 5. 格式：50-146字，短句为主，适当换行，无Markdown/列表符号。
-
-{critique_section}
 
 ## 输出
 以纯JSON对象返回，key为"greeting"，value为招呼语文本。不要包含markdown代码块标记。"""
@@ -54,16 +81,21 @@ REVIEW_PROMPT = """评估BOSS直聘招呼语质量。
 - 招呼语：{greeting}
 
 ## 评分（每项1-10分）
-1. 去模板化：首句有具体名词/数据？避开所有套话及新型模板？结尾为陈述句且无问句/邀约/客套？
+1. 去模板化：首句以JD具体名词/数据起笔？避开所有人称代词/感知动词开头的套话？结尾为陈述句且无问句/邀约/客套？
 2. 自然度：像真人IM消息，略微口语化、无公文/AI感？
 3. 相关性：针对岗位突出1-2个匹配点，不泛泛而谈？
 4. 真实性：仅用候选人真实背景，无捏造？
 5. 可读性：短句为主，适配手机阅读？
 
-若第1项<7分，critique须指出具体套话/问题结尾，并给出基于真实素材的陈述句改写方向（20字内）。
+若第1项<7分，critique须指出问题类型（如"首句以感知动词起笔"），并给出基于真实素材的改写方向（20字内）。
+⚠ critique中严禁复述原文中的套话短语，只描述问题类别和改写方向。
 
 ## 输出
-以纯JSON对象返回，包含de_template,naturalness,relevance,authenticity,readability,avg,critique字段。不要包含markdown代码块标记。"""
+以纯JSON返回，仅包含以下3个字段：
+{{"avg": float, "pass": bool, "critique": string}}
+- pass: avg>=7 则为 true
+- critique: 仅当 pass=false 时填写(≤30字)，否则为空字符串
+不要包含其他字段。"""
 
 # ─── 工具函数 ─────────────────────────────────────────────────────
 def _get_resume_summary(config: dict) -> str:
@@ -73,15 +105,14 @@ def _get_resume_summary(config: dict) -> str:
     content = resume_path.read_text(encoding="utf-8")
     return content[:1500]
 
-
 def _call_ai(
-    prompt: str,
+    messages: list[dict],
     config: dict,
     max_tokens: int = 300,
     attempt: int = 1,
     json_mode: bool = False,
 ) -> str | None:
-    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避与错误分类）"""
+    """根据 config.ai 配置调用 OpenAI 兼容模型（含请求级限流、TPM/RPM区分退避、finish_reason防御）"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
 
@@ -107,16 +138,16 @@ def _call_ai(
     }
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.7,
         "reasoning_effort": "none",
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+
+    # ★ 请求级滑动窗口限流：每次 API 调用前等待
+    _limiter.wait()
 
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
@@ -125,33 +156,70 @@ def _call_ai(
         if resp.status_code != 200:
             console.print(f"[red]❌ API错误响应: {resp.text[:500]}[/red]")
 
-        # 🆕 429 退避增加上限保护
+        # ★ 429 退避：区分 TPM / RPM 限流类型
         if resp.status_code == 429:
+            err_body = {}
+            try:
+                err_body = resp.json().get("error", {})
+            except Exception:
+                pass
+            err_code = str(err_body.get("code", ""))
+            err_msg = str(err_body.get("message", ""))
+
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 wait_time = min(float(retry_after) + random.uniform(0.5, 1.5), MAX_RETRY_WAIT)
+                console.print(
+                    f"[yellow]⏳ 服务端指定Retry-After，等待 {wait_time:.1f}s 后重试 "
+                    f"(第{attempt}次)[/yellow]"
+                )
+            elif "tpm" in err_code.lower() or "tpm" in err_msg.lower():
+                # TPM 限流：短等待，token 配额通常秒级恢复
+                wait_time = min(3.0 + random.uniform(0, 2), MAX_RETRY_WAIT)
+                console.print(f"[yellow]⏳ TPM限流({err_code})，短等待 {wait_time:.1f}s[/yellow]")
             else:
+                # RPM 或其他限流：指数退避 + 上限保护
                 wait_time = min(
                     15 * (2 ** (attempt - 1)) + random.uniform(0, 2),
                     MAX_RETRY_WAIT
                 )
+                console.print(
+                    f"[yellow]⏳ RPM限流，等待 {wait_time:.1f}s 后重试 "
+                    f"(第{attempt}次)[/yellow]"
+                )
 
-            console.print(
-                f"[yellow]⏳ 触发RPM限流，等待 {wait_time:.1f}s 后重试 "
-                f"(第{attempt}/{MAX_GENERATE_RETRIES}次)[/yellow]"
-            )
             time.sleep(wait_time)
-            raise AIRequestError(kind="rate_limit", user_message=f"HTTP 429: RPM exhausted, waited {wait_time:.1f}s")
+            raise AIRequestError(
+                kind="rate_limit",
+                user_message=f"HTTP 429: {err_code or 'rate_limited'}, waited {wait_time:.1f}s"
+            )
 
         resp.raise_for_status()
         data = resp.json()
+
+        # 💰 缓存监控日志
+        usage = data.get("usage", {})
+        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        total_prompt = usage.get("prompt_tokens", 0)
+        if cached > 0:
+            console.print(f"[dim]💰 缓存命中: {cached}/{total_prompt} prompt tokens[/dim]")
 
         choices = data.get("choices", [])
         if not choices:
             console.print(f"[red]❌ 响应中无 choices 字段: {str(data)[:300]}[/red]")
             return None
 
-        msg = choices[0].get("message", {})
+        choice = choices[0]
+        msg = choice.get("message", {})
+        finish_reason = choice.get("finish_reason")
+
+        # ★ finish_reason 防御
+        if finish_reason == "content_filter":
+            console.print(f"[yellow]⚠ 内容被合规审核拦截，跳过[/yellow]")
+            return None
+        if finish_reason == "length":
+            console.print(f"[yellow]⚠ 输出被截断(finish_reason=length)，结果可能不完整[/yellow]")
+
         content = msg.get("content") or ""
 
         if not content:
@@ -192,7 +260,6 @@ def _call_ai(
         console.print(f"[red]❌ 请求异常: {type(exc).__name__}: {exc}[/red]")
         raise AIRequestError(kind="network", user_message=str(exc)) from exc
 
-
 def _truncate_prompt_text(text: str, limit: int) -> str:
     text = str(text or "")
     if len(text) <= limit:
@@ -211,7 +278,7 @@ def _notify(config: dict, message: str, *, error: bool = False) -> None:
 
 
 def _parse_json_response(response: str) -> dict | None:
-    """🆕 统一 JSON 解析：先直接解析，失败则花括号截取兜底"""
+    """统一 JSON 解析：先直接解析，失败则花括号截取兜底"""
     if not response:
         return None
     cleaned = response.strip()
@@ -246,7 +313,6 @@ def _review_greeting(
     greeting: str,
     job: dict,
     config: dict,
-    max_tokens: int = 300,
     attempt: int = 1,
 ) -> dict | None:
     prompt = REVIEW_PROMPT.format(
@@ -254,7 +320,11 @@ def _review_greeting(
         company=job["company"],
         greeting=greeting,
     )
-    response = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    response = _call_ai(messages, config, max_tokens=AI_MAX_REVIEW_TOKENS, attempt=attempt, json_mode=True)
     return _parse_json_response(response)
 
 
@@ -265,13 +335,12 @@ def _generate_greeting_once(
     critique: str = "",
     *,
     compact: bool = False,
-    max_tokens: int = 300,
+    max_tokens: int = AI_MAX_GENERATE_TOKENS,
     attempt: int = 1,
 ) -> str | None:
     jd_limit = 250 if compact else 500
     resume_limit = 800 if compact else 1500
     jd_summary = _truncate_prompt_text(job.get("jd", ""), jd_limit) or "无详细描述"
-    critique_section = f"\n7. 上次生成的问题: {critique}，请避免此问题\n" if critique else ""
 
     profile_cfg = config.get("profile", {})
     highlights = profile_cfg.get("extra_highlights", [])
@@ -281,22 +350,32 @@ def _generate_greeting_once(
         highlight_lines.append(f"- 个人作品集网址：{portfolio_url}")
     extra_highlights = "\n".join(highlight_lines) if highlight_lines else "（无额外亮点配置）"
 
-    prompt = GREETING_PROMPT.format(
+    # ★ 主 Prompt 不再嵌入 critique，保持前缀稳定以命中缓存
+    main_prompt = GREETING_PROMPT.format(
         resume_summary=_truncate_prompt_text(resume_summary, resume_limit),
         title=job["title"],
         company=job["company"],
         salary=job["salary"] or "面议",
         jd_summary=jd_summary,
         match_reason=_truncate_prompt_text(job.get("score_reason", ""), 240),
-        critique_section=critique_section,
         extra_highlights=_truncate_prompt_text(extra_highlights, 500),
     )
 
-    greeting_raw = _call_ai(prompt, config, max_tokens, attempt=attempt, json_mode=True)
+    # ★ 构造 messages：主 Prompt 固定 + critique 作为独立 user 消息追加
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": main_prompt},
+    ]
+    if critique:
+        messages.append({
+            "role": "user",
+            "content": f"上次生成的问题：{critique}，请避免此问题并重新生成。"
+        })
+
+    greeting_raw = _call_ai(messages, config, max_tokens=max_tokens, attempt=attempt, json_mode=True)
     if not greeting_raw:
         return None
 
-    # 🆕 使用统一解析函数
     data = _parse_json_response(greeting_raw)
     if not data:
         console.print("[yellow]⚠ JSON解析失败，视为生成失败[/yellow]")
@@ -340,7 +419,7 @@ def _generate_with_retry(
             last_error = exc
             if exc.kind in ("auth", "non_retryable"):
                 console.print(f"[red]  AI 请求不可重试（{exc.kind}），停止[/red]")
-                break
+                raise  # ★ auth 错误向上抛出，触发全局熔断
             if exc.kind == "context_limit" and attempt < MAX_GENERATE_RETRIES:
                 try:
                     result = _generate_greeting_once(
@@ -371,7 +450,7 @@ def _review_with_retry(greeting: str, job: dict, config: dict) -> dict | None:
                 return result
         except AIRequestError as exc:
             if exc.kind in ("auth", "non_retryable"):
-                break
+                raise  # ★ auth 错误向上抛出
         except Exception:
             pass
     return None
@@ -428,18 +507,32 @@ def generate_greetings(config: dict) -> int:
                     critique = ""
 
                     if iteration > 0 and best_greeting:
-                        review = _review_with_retry(best_greeting, job, config)
-                        if review and review.get("avg", 10) >= review_threshold:
+                        try:
+                            review = _review_with_retry(best_greeting, job, config)
+                        except AIRequestError as exc:
+                            if exc.kind == "auth":
+                                console.print("[red]🛑 检测到AI凭证错误，立即终止招呼语生成！[/red]")
+                                db.close()
+                                return count
+                            review = None
+
+                        if review and review.get("pass", False):
                             break
-                        # 🆕 Review 失败时使用兜底 critique，避免浪费迭代
+                        # Review 失败或未通过时使用 critique
                         critique = review.get("critique", DEFAULT_CRITIQUE) if review else DEFAULT_CRITIQUE
 
-                    greeting = _generate_with_retry(job, resume_summary, config, critique)
+                    try:
+                        greeting = _generate_with_retry(job, resume_summary, config, critique)
+                    except AIRequestError as exc:
+                        if exc.kind == "auth":
+                            console.print("[red]🛑 检测到AI凭证错误，立即终止招呼语生成！[/red]")
+                            db.close()
+                            return count
+                        greeting = None
 
                     if not greeting:
                         break
 
-                    # best_greeting = f"{DEFAULT_GREETING}{greeting}"
                     best_greeting = greeting
 
                     if max_iterations == 0:
@@ -457,12 +550,8 @@ def generate_greetings(config: dict) -> int:
             update_job_status(db, job["id"], "ready")
             count += 1
             progress.update(task, advance=1)
-            print(best_greeting)
-            if index < len(jobs):
-                jitter = random.uniform(0, 1.0)
-                sleep_time = GLOBAL_REQUEST_INTERVAL + jitter
-                console.print(f"[dim]💤 全局节流: 等待 {sleep_time:.1f}s 后处理下一个岗位[/dim]")
-                time.sleep(sleep_time)
+            console.print(f"  [green]📝 {best_greeting}[/green]")
+            # ★ 不再需要岗位级 sleep，限流已下沉到 _call_ai 请求级
 
     db.close()
 

@@ -16,9 +16,16 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_status, update_
 
 console = Console()
 
-SCORE_PROMPT = """你是一位资深技术招聘顾问。请根据以下简历和岗位描述，评估匹配程度。
+# ─── Prompt 模板（System/User 分离，最大化缓存命中） ───────────────────────────────────────
+SYSTEM_PROMPT = (
+    "你是一位资深技术招聘顾问。评估简历与岗位的匹配度。\n"
+    "【输出强制约束】\n"
+    "1. 必须且只能输出合法的JSON对象\n"
+    "2. 格式严格为：{\"score\": int(0-100), \"reason\": \"50字内简述\"}\n"
+    "3. 禁止输出任何思考过程、分析文字、Markdown标记或额外字段"
+)
 
-## 简历摘要
+USER_PROMPT_TEMPLATE = """## 简历摘要
 {resume_summary}
 
 ## 岗位信息
@@ -34,18 +41,38 @@ SCORE_PROMPT = """你是一位资深技术招聘顾问。请根据以下简历�
 4. 薪资匹配度（10%）
 5. 发展空间（10%）
 
-## ⚠️ 输出格式要求（严格遵守）
-- 必须输出合法的 JSON 对象
-- 格式：{{"score": 75, "reason": "50字内简述"}}
-- 禁止输出任何分析过程、解释文字或 Markdown 标记
-"""
+请根据上述信息评估匹配程度。"""
+
+RE_EVAL_PROMPT_TEMPLATE = """## 二次独立评估请求
+上一轮你对该岗位的评分为 {first_score} 分，理由：{first_reason}
+请抛开先前判断，仅基于以下核心信息重新独立评估：
+- 职位：{title} @ {company}
+- 简历关键匹配点：{resume_snippet}
+- JD核心要求：{jd_snippet}
+
+请重新给出你的独立判断。"""
+
 
 # ─── 配置常量 ───────────────────────────────────────────────
 MAX_SCORE_RETRIES = 3
-DEFAULT_SCORE_ON_FAILURE = 100
-RETRY_DELAY_SECONDS = 2
 GLOBAL_REQUEST_INTERVAL = 3.0   # 全局请求间隔(秒)，防止触碰RPM上限
 MAX_RETRY_WAIT = 10.0           # 429 限流最大等待秒数
+AI_MAX_TOKENS = 150             # 评分JSON极短，150 tokens足够冗余
+
+
+class RateLimiter:
+    """简易滑动窗口限流器，精确控制请求间隔"""
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._last_call = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        elapsed = now - self._last_call
+        if elapsed < self.interval:
+            sleep_time = self.interval - elapsed + random.uniform(0, 0.3)
+            time.sleep(sleep_time)
+        self._last_call = time.monotonic()
 
 
 def _get_resume_summary(config: dict) -> str:
@@ -55,8 +82,8 @@ def _get_resume_summary(config: dict) -> str:
     return resume_path.read_text(encoding="utf-8")[:2000]
 
 
-def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1) -> str | None:
-    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避）"""
+def _call_ai(messages: list[dict], config: dict, max_tokens: int = AI_MAX_TOKENS, attempt: int = 1) -> str | None:
+    """根据 config.ai 配置调用 OpenAI 兼容模型（含429指数退避与缓存监控）"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
 
@@ -81,14 +108,14 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         "Content-Type": "application/json",
     }
 
-    # 🆕 针对 DeepSeek V4 Flash 优化的 payload
+    # 针对 DeepSeek V4 Flash 优化的 payload
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.1,
         "reasoning_effort": "none",                  # 关闭思考模式，节省 token 和时间
-        "response_format": {"type": "json_object"}   # 启用原生 JSON 输出，杜绝格式问题
+        "response_format": {"type": "json_object"}   # 启用原生 JSON 输出
     }
 
     try:
@@ -119,12 +146,29 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         resp.raise_for_status()
         data = resp.json()
 
+        # 💰 缓存监控日志
+        usage = data.get("usage", {})
+        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        total_prompt = usage.get("prompt_tokens", 0)
+        if cached > 0:
+            console.print(f"[dim]💰 [Score] 缓存命中: {cached}/{total_prompt} prompt tokens[/dim]")
+
         choices = data.get("choices", [])
         if not choices:
             console.print(f"[red]❌ [Score] 响应中无 choices 字段: {str(data)[:300]}[/red]")
             return None
 
-        msg = choices[0].get("message", {})
+        choice = choices[0]
+        msg = choice.get("message", {})
+        finish_reason = choice.get("finish_reason")
+
+        # 防御性检查：合规拦截或截断
+        if finish_reason == "content_filter":
+            console.print(f"[yellow]⚠ [Score] 内容被合规审核拦截，跳过[/yellow]")
+            return None
+        if finish_reason == "length":
+            console.print(f"[yellow]⚠ [Score] 输出被截断(finish_reason=length)，结果可能不完整[/yellow]")
+
         content = msg.get("content") or msg.get("reasoning_content") or msg.get("text") or ""
 
         if not content:
@@ -154,9 +198,9 @@ def _call_ai(prompt: str, config: dict, max_tokens: int = 500, attempt: int = 1)
         raise AIRequestError(kind="network", message=str(exc)) from exc
 
 
-def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
+def _call_score_ai(messages: list[dict], config: dict, attempt: int = 1) -> dict | None:
     """Call AI for scoring, return parsed dict or None."""
-    response = _call_ai(prompt, config, max_tokens=500, attempt=attempt)
+    response = _call_ai(messages, config, max_tokens=AI_MAX_TOKENS, attempt=attempt)
     if not response:
         return None
 
@@ -164,7 +208,7 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
 
     cleaned = response.strip()
 
-    # 1. 去除 Markdown 代码块（虽然启用了 json_object，但保留作为安全网）
+    # 1. 去除 Markdown 代码块（安全网）
     if cleaned.startswith("```"):
         first_nl = cleaned.index("\n") if "\n" in cleaned else 3
         cleaned = cleaned[first_nl + 1:]
@@ -209,21 +253,32 @@ def _call_score_ai(prompt: str, config: dict, attempt: int = 1) -> dict | None:
                     pass
                 break
 
-    # 4. 正则兜底
+    # 4. 正则兜底提取（增强校验）
     score_match = re.search(r'(?:score|分数|匹配度)[^\d]*(\d{1,3})', cleaned)
     reason_match = re.search(r'(?:reason|原因|总结)[：:]\s*(.{10,80})', cleaned)
     if score_match:
-        fallback_score = max(0, min(100, int(score_match.group(1))))
-        fallback_reason = reason_match.group(1).strip() if reason_match else "AI未返回标准JSON，从文本中提取"
-        console.print(f"[yellow]⚠ [Score] 正则兜底提取: score={fallback_score}[/yellow]")
-        return {"score": fallback_score, "reason": fallback_reason}
+        raw_score = int(score_match.group(1))
+        # 校验：分数必须在 0-100 且 reason 长度合理
+        if 0 <= raw_score <= 100 and reason_match and len(reason_match.group(1).strip()) >= 5:
+            fallback_reason = reason_match.group(1).strip()
+            console.print(f"[yellow]⚠ [Score] 正则兜底提取: score={raw_score}[/yellow]")
+            return {"score": raw_score, "reason": fallback_reason}
+        else:
+            console.print(f"[yellow]⚠ [Score] 正则提取值异常(score={raw_score})，视为解析失败[/yellow]")
 
-    console.print(f"[red]❌ [Score] 所有解析方式均失败，兜底100分 | 内容: {cleaned[:200]}[/red]")
-    return {"score": 100, "reason": "AI响应解析失败，兜底满分"}
+    # 解析彻底失败 → 返回 None
+    console.print(f"[red]❌ [Score] 所有解析方式均失败，跳过该岗位 | 内容: {cleaned[:200]}[/red]")
+    return None
 
 
-def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str]:
-    base_prompt = SCORE_PROMPT.format(
+def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int, str, str | None]:
+    """
+    对单个岗位进行AI评分。
+    返回: (score, reason, error_kind)
+    - 成功时: (score, reason, None)
+    - 失败时: (None, None, error_kind)  # error_kind 为 "auth", "network" 等，用于外层熔断
+    """
+    base_user_prompt = USER_PROMPT_TEMPLATE.format(
         resume_summary=resume_summary,
         title=job["title"],
         company=job["company"],
@@ -231,45 +286,49 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
         jd=(job.get("jd") or "")[:800],
     )
 
-    # 正确获取嵌套在 scoring 下的及格线阈值
     scoring_cfg = config.get("scoring", {})
     threshold = float(scoring_cfg.get("threshold", 50))
 
-    # 用于记录第一次评分结果，以便在低分时进行二次评估
     first_score: int | None = None
     first_reason: str = ""
-    last_error: Exception | None = None
+    last_error_kind: str | None = None
 
     # 最多进行两轮评分：第一轮正常评分，如果低分则触发第二轮
     for eval_round in range(1, 3):
-        # 二次评估使用差异化 Prompt，避免 AI 返回相同结果
+        # 构造 messages (System 保持不变以命中缓存，User 动态变化)
         if eval_round == 2:
-            prompt = base_prompt + (
-                "\n\n## ⚠️ 二次评估提醒\n"
-                "这是对该岗位的重新独立评估。请抛开先前可能存在的偏见，"
-                "重新审视简历与岗位的匹配度，给出你的独立判断。"
+            user_prompt = RE_EVAL_PROMPT_TEMPLATE.format(
+                first_score=first_score,
+                first_reason=first_reason,
+                title=job["title"],
+                company=job["company"],
+                resume_snippet=resume_summary[:300],
+                jd_snippet=(job.get("jd") or "")[:300]
             )
             console.print(f"[yellow]  ⏳ 二次评估前等待 2 秒，避免触发限流...[/yellow]")
             time.sleep(2)
         else:
-            prompt = base_prompt
+            user_prompt = base_user_prompt
 
-        last_error = None  # 每轮重置错误记录
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
 
-        # 原有的重试机制保持不变
+        last_error_kind = None  # 每轮重置错误记录
+
         for attempt in range(1, MAX_SCORE_RETRIES + 1):
             console.print(f"[dim]🔄 [Score] {job['company']}｜{job['title']} 第 {eval_round} 轮第 {attempt}/{MAX_SCORE_RETRIES} 次[/dim]")
             try:
-                result = _call_score_ai(prompt, config, attempt=attempt)
+                result = _call_score_ai(messages, config, attempt=attempt)
 
-                # 打印一下 AI 返回的原始数据，方便排查
                 console.print(f"[dim]   📥 AI原始返回: {result}[/dim]")
 
                 if result and isinstance(result.get("score"), (int, float)):
                     score = max(0, min(100, int(result["score"])))
                     reason = str(result.get("reason", ""))[:200]
 
-                    # === 核心逻辑：判断是否需要二次评估 ===
+                    # 核心逻辑：判断是否需要二次评估
                     if eval_round == 1 and score < threshold:
                         first_score = score
                         first_reason = reason
@@ -284,35 +343,33 @@ def _score_single_job(job: dict, resume_summary: str, config: dict) -> tuple[int
                             f"第一次({first_score}分): {first_reason}；"
                             f"第二次({score}分): {reason}"
                         )[:200]
-                        return avg_score, combined_reason
+                        return avg_score, combined_reason, None
                     else:
-                        return score, reason
+                        return score, reason, None
 
-                # 如果没拿到有效分数，记录错误
-                last_error = ValueError(f"AI返回格式异常或缺少score: {result}")
+                # AI返回了但缺少有效score字段
+                last_error_kind = "parse_error"
 
             except AIRequestError as exc:
-                last_error = exc
+                last_error_kind = exc.kind
                 if exc.kind == "auth":
                     console.print(f"[red]  ❌ AI 凭证问题，停止重试[/red]")
-                    return DEFAULT_SCORE_ON_FAILURE, f"AI凭证错误: {exc}"
+                    return None, None, "auth"  # 凭证错误直接返回，触发全局熔断
             except Exception as exc:
-                last_error = exc
+                last_error_kind = "unknown"
 
             if attempt < MAX_SCORE_RETRIES:
                 console.print(f"[yellow]  评分第 {attempt} 次失败，重试中...[/yellow]")
 
-        # 如果第一轮重试全部失败且未获得有效分数，跳出外层循环进入全局兜底
+        # 第一轮重试全部失败且未获得有效分数，跳出外层循环
         if eval_round == 1 and first_score is None:
             break
 
-    # 全局兜底（仅当两轮都未返回有效结果时到达此处）
+    # 两轮都失败时返回 None，由上层决定跳过
     console.print(
-        f"[red]  ❌ {job['company']}｜{job['title']} 评分失败，使用默认分数 {DEFAULT_SCORE_ON_FAILURE}[/red]"
+        f"[yellow]  ⏭ {job['company']}｜{job['title']} 评分失败({last_error_kind})，跳过，下次再评[/yellow]"
     )
-    error_type = type(last_error).__name__ if last_error else "unknown"
-    reason = f"AI评分失败（{error_type}），使用默认分数"
-    return DEFAULT_SCORE_ON_FAILURE, reason
+    return None, None, last_error_kind
 
 
 def score_jobs(config: dict) -> tuple[int, int]:
@@ -339,7 +396,11 @@ def score_jobs(config: dict) -> tuple[int, int]:
 
     approved_count = 0
     filtered_count = 0
-    pre_filtered_count = 0  # 预筛淘汰计数
+    pre_filtered_count = 0
+    skipped_count = 0
+
+    # 初始化滑动窗口限流器
+    limiter = RateLimiter(GLOBAL_REQUEST_INTERVAL)
 
     with Progress(
         SpinnerColumn(),
@@ -349,9 +410,16 @@ def score_jobs(config: dict) -> tuple[int, int]:
         task = progress.add_task(f"AI 评分 (0/{len(jobs)})", total=len(jobs))
 
         for index, job in enumerate(jobs, start=1):
+            # 更新进度条（嵌入实时统计）
             progress.update(
                 task,
-                description=f"评分: {job['company'][:10]} - {job['title'][:15]} ({index}/{len(jobs)})",
+                description=(
+                    f"评分: {job['company'][:8]}.. | "
+                    f"[green]✓{approved_count}[/green] "
+                    f"[dim]✗{filtered_count}[/dim] "
+                    f"[yellow]⏭{skipped_count}[/yellow] | "
+                    f"{index}/{len(jobs)}"
+                ),
             )
 
             # ═══ 预筛硬过滤（不调用 LLM，零成本） ═══
@@ -366,10 +434,26 @@ def score_jobs(config: dict) -> tuple[int, int]:
                 filtered_count += 1
                 pre_filtered_count += 1
                 progress.update(task, advance=1)
-                continue  # 跳过 LLM，省 token
+                continue
 
             # ═══ 通过预筛 → AI 打分 ═══
-            score, reason = _score_single_job(job, resume_summary, config)
+            limiter.wait()  # 精确控制请求间隔
+            score, reason, error_kind = _score_single_job(job, resume_summary, config)
+
+            # ★ 凭证熔断：检测到 auth 错误立即终止整个流程
+            if error_kind == "auth":
+                console.print("[red]🛑 检测到AI凭证错误，立即终止评分流程！请检查 config.yaml[/red]")
+                break
+
+            # ★ 失败跳过：保持 pending 状态，下次再评
+            if score is None:
+                skipped_count += 1
+                console.print(
+                    f"  [yellow]⏭ 跳过: {job['company']}｜{job['title']} (保持pending，下次再评)[/yellow]"
+                )
+                progress.update(task, advance=1)
+                continue
+
             update_job_score(db, job["id"], score, reason)
 
             if score >= threshold:
@@ -389,15 +473,11 @@ def score_jobs(config: dict) -> tuple[int, int]:
 
             progress.update(task, advance=1)
 
-            # 全局速率节流
-            if index < len(jobs):
-                jitter = random.uniform(0, 1.0)
-                time.sleep(GLOBAL_REQUEST_INTERVAL + jitter)
-
     db.close()
     console.print(
         f"\n[green]✓ 评分完成: {approved_count} approved / "
-        f"{filtered_count} filtered (其中预筛淘汰 {pre_filtered_count})[/green]"
+        f"{filtered_count} filtered (预筛 {pre_filtered_count}) / "
+        f"{skipped_count} skipped[/green]"
     )
 
     # ═══ 自动衔接：评分 → 招呼语 → 发送 ═══
@@ -419,6 +499,6 @@ def score_jobs(config: dict) -> tuple[int, int]:
             console.print(f"[red]发送阶段异常: {exc}[/red]")
             console.print("[yellow]可手动执行: bosshunter send[/yellow]")
     else:
-        console.print("[yellow]没有通过评分的岗位，跳过。[/yellow]")
+        console.print("[yellow]没有通过评分的岗位，跳过后续流程。[/yellow]")
 
     return approved_count, filtered_count

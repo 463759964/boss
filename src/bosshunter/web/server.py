@@ -286,13 +286,30 @@ def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
 
 	is_direct_send = bool(config.get("_workbench_skip_greeting"))
 
-	if not is_direct_send:
-		_log(task, "生成招呼语")
+	if is_direct_send:
+		# ── 防御性分支：直接发送模式，物理隔离 AI 生成 ──
+		_log(task, "📤 直接发送模式：跳过 AI 生成")
+		db = _get_web_db()
+		try:
+			target_ids = set(config.get("_workbench_job_ids", []))
+			jobs_without_greeting = []
+			for job in get_jobs_ready_to_send(db):
+				if target_ids and str(job["id"]) not in target_ids:
+					continue
+				if not job.get("greeting"):
+					jobs_without_greeting.append(str(job["id"]))
+			if jobs_without_greeting:
+				_log(task, f"⚠ {len(jobs_without_greeting)} 个岗位无招呼语，将使用默认兜底语发送")
+		finally:
+			db.close()
+	else:
+		# ── 标准分支：先生成再发送 ──
+		_log(task, "🤖 生成招呼语")
 		generate_greetings(config)
 		if task.stop_requested.is_set():
 			return
 
-		# ── 关键补丁：仅在【生成模式】下执行，direct_send 时跳过 ──
+		# 仅在【生成模式】下执行自动确认，direct_send 时跳过
 		db = _get_web_db()
 		try:
 			ready_jobs = get_jobs_ready_to_send(db)
@@ -302,11 +319,11 @@ def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
 					continue
 				update_job_status(db, job["id"], "approved")
 			if ready_jobs:
-				_log(task, f"自动确认 {len(ready_jobs)} 个岗位，准备发送")
+				_log(task, f"✅ 自动确认 {len(ready_jobs)} 个岗位，准备发送")
 		finally:
 			db.close()
 
-	_log(task, "发送招呼语")
+	_log(task, "📬 发送招呼语")
 	send_greetings(config, force=True)
 
 

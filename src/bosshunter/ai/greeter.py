@@ -15,18 +15,19 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, updat
 console = Console()
 
 # ─── 兜底与限流配置 ───────────────────────────────────────────────
-DEFAULT_GREETING = "跟我很匹配呀"
+DEFAULT_GREETING = "过往经验很匹配"
 MAX_GENERATE_RETRIES = 2
 MAX_REVIEW_RETRIES = 2
-GLOBAL_REQUEST_INTERVAL = 4.0
-MAX_RETRY_WAIT = 15.0
 DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"
 AI_MAX_GENERATE_TOKENS = 300
 AI_MAX_REVIEW_TOKENS = 120
+# 限流配置常量
+GLOBAL_REQUEST_INTERVAL = 2.5
+MAX_RETRY_WAIT = 10.0
+TPM_BASE_WAIT = 1.5
 
-
+# RateLimiter 类（含 reset 方法）
 class RateLimiter:
-    """简易滑动窗口限流器，精确控制请求间隔"""
     def __init__(self, interval: float):
         self.interval = interval
         self._last_call = 0.0
@@ -35,10 +36,13 @@ class RateLimiter:
         now = time.monotonic()
         elapsed = now - self._last_call
         if elapsed < self.interval:
-            sleep_time = self.interval - elapsed + random.uniform(0, 0.3)
+            sleep_time = self.interval - elapsed + random.uniform(0, 0.2)
             time.sleep(sleep_time)
         self._last_call = time.monotonic()
 
+    def reset(self):
+        """429 退避后重置计时器，避免双重等待"""
+        self._last_call = 0.0
 
 _limiter = RateLimiter(GLOBAL_REQUEST_INTERVAL)
 
@@ -66,7 +70,7 @@ GREETING_PROMPT = """你在BOSS直聘给HR发招呼语，目标是让对方愿�
    ✅ 正确范式："你们JD提到的{{jd_keyword}}，我在{{real_project}}中负责过{{specific_task}}"
    ✅ 正确范式："{{jd_keyword}}这块我比较熟，之前在{{company_or_project}}做过{{concrete_result}}"
    ❌ 错误范式：以"您好""看到""注意到""对...感兴趣"等人称代词或感知动词起笔
-3. 内容：只突出1-2个与JD强相关的匹配优势；每提一个自身经历，必须能对应到JD中的具体要求；不谄媚；严禁把JD内容当作我的经历。
+3. 内容：只突出1-2个与JD强相关的匹配优势；每提一个自身经历，必须能对应到JD中的具体要求；不谄媚；严禁把JD内容当作我的经历。严禁说我的学历。
 4. 结尾：必须陈述句收尾，且提供与JD相关的信息增量（如补充JD关注点的成果/匹配细节）。禁止问句、邀约、客套话（"方便聊聊""期待沟通""盼回复"等）。
 5. 格式：50-146字，短句为主，适当换行，无Markdown/列表符号。
 
@@ -115,7 +119,7 @@ def _call_ai(
     attempt: int = 1,
     json_mode: bool = False,
 ) -> str | None:
-    """调用 OpenAI 兼容模型，含限流、退避、finish_reason 防御"""
+    """调用 OpenAI 兼容模型，含智能限流退避与全局锁重置"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
 
@@ -150,12 +154,15 @@ def _call_ai(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    _limiter.wait()
+    # ★ 仅在首次请求时执行全局限流，429重试时跳过（由退避逻辑接管）
+    if attempt == 1:
+        _limiter.wait()
 
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
         console.print(f"[dim]📡 HTTP {resp.status_code} | 响应长度: {len(resp.text)}[/dim]")
 
+        # ★ 429 智能退避：区分 TPM/RPM/Retry-After
         if resp.status_code == 429:
             err_body = {}
             try:
@@ -167,17 +174,23 @@ def _call_ai(
 
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
-                wait_time = min(float(retry_after) + random.uniform(0.5, 1.5), MAX_RETRY_WAIT)
-                console.print(f"[yellow]⏳ Retry-After 指定等待 {wait_time:.1f}s (第{attempt}次)[/yellow]")
-            elif "tpm" in err_code.lower() or "tpm" in err_msg.lower():
-                wait_time = min(3.0 + random.uniform(0, 2), MAX_RETRY_WAIT)
+                wait_time = min(float(retry_after) + random.uniform(0.3, 0.8), MAX_RETRY_WAIT)
+                console.print(f"[yellow]⏳ Retry-After 等待 {wait_time:.1f}s (第{attempt}次)[/yellow]")
+            elif "tpm" in err_code.lower() or "tpm" in err_msg.lower() or err_code == "429001":
+                # TPM 限流：秒级恢复，短等待
+                wait_time = min(TPM_BASE_WAIT + random.uniform(0, 1.0), MAX_RETRY_WAIT)
                 console.print(f"[yellow]⏳ TPM限流({err_code})，短等待 {wait_time:.1f}s[/yellow]")
             else:
-                wait_time = min(15 * (2 ** (attempt - 1)) + random.uniform(0, 2), MAX_RETRY_WAIT)
+                # RPM 限流：指数退避从 4s 起步
+                wait_time = min(4 * (2 ** (attempt - 1)) + random.uniform(0, 1), MAX_RETRY_WAIT)
                 console.print(f"[yellow]⏳ RPM限流，等待 {wait_time:.1f}s (第{attempt}次)[/yellow]")
 
             time.sleep(wait_time)
-            raise AIRequestError(kind="rate_limit", user_message=f"HTTP 429: {err_code or 'rate_limited'}, waited {wait_time:.1f}s")
+            _limiter.reset()  # ★ 关键：退避后重置全局锁，避免下次重试叠加等待
+            raise AIRequestError(
+                kind="rate_limit",
+                user_message=f"HTTP 429: {err_code or 'rate_limited'}, waited {wait_time:.1f}s"
+            )
 
         if resp.status_code != 200:
             console.print(f"[red]❌ API错误响应: {resp.text[:500]}[/red]")
@@ -185,7 +198,7 @@ def _call_ai(
         resp.raise_for_status()
         data = resp.json()
 
-        # 缓存监控
+        # 💰 缓存命中监控
         usage = data.get("usage", {})
         cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
         total_prompt = usage.get("prompt_tokens", 0)
@@ -201,6 +214,7 @@ def _call_ai(
         msg = choice.get("message", {})
         finish_reason = choice.get("finish_reason")
 
+        # ★ finish_reason 防御
         if finish_reason == "content_filter":
             console.print("[yellow]⚠ 内容被合规审核拦截[/yellow]")
             return None

@@ -70,7 +70,6 @@ DEFAULTS: dict[str, Any] = {
         "salary_max": 0,
         "allow_internship": False,
         "deal_breakers": [],
-        "allow_internship": False,
     },
     "search": {
         "keywords": [],
@@ -78,7 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "max_pages": 3,
     },
     "scoring": {
-        "threshold": 71,
+        "threshold": 60,
         "max_candidates": 20,
     },
     "throttle": {

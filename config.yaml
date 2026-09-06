@@ -1,0 +1,94 @@
+profile:
+  resume_path: C:\Users\46375\Documents\BossHunter\data\resumes\座舱测试.md
+  resume_output_dir: ./data/resumes
+  target_cities:
+  - 大连
+  - 上海
+  - 南京
+  - 合肥
+  - 武汉
+  - 杭州
+  - 深圳
+  - 广州
+  - 苏州
+  salary_min: 11
+  salary_max: 17
+  allow_internship: false
+  deal_breakers:
+  - 虹软
+  - 游戏
+  - 药
+  - 服装
+  - 生产
+  - 销售
+  - 化妆
+  - 开发
+  - 银行
+  - 主管
+  - 兼职
+search:
+  keywords:
+  - 座舱
+  - 车载
+  - 质量
+  cities:
+  - 大连
+  - 上海
+  - 南京
+  - 合肥
+  - 武汉
+  - 杭州
+  - 深圳
+  - 广州
+  - 苏州
+  max_pages: 4
+scoring:
+  threshold: 45
+  max_workers: 4          # 并发线程数
+  rpm_limit: 120          # 全局每分钟请求上限
+throttle:
+  daily_limit: 170
+  interval_min: 30
+  interval_max: 60
+  browse_before_greet: true
+  browse_duration_min: 10
+  browse_duration_max: 30
+  send_windows: []
+  day_off_probability: 0.1
+ai:
+  provider: openai_compatible
+  service: custom
+  models:
+    - sensenova-6.8-flash-lite
+    - sensenova-u1.5-lite
+    - sensenova-u1-fast
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - glm-5.2
+    - kimi-k3
+  greeting_review_threshold: 7
+  greeting_max_iterations: 2
+  base_url: https://token.sensenova.cn/v1
+  api_key: sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
+monitor:
+  interval: 30
+  chat_url: https://www.zhipin.com/web/geek/chat
+  max_resume_sends_per_cycle: 20
+  auto_reply_hr_questions: false
+follow_up:
+  enabled: false
+  interval_hours: 40
+  skip_weekends: false
+dedup:
+  history_file: ./data/history.jsonl
+browser:
+  runtime: builtin
+  proxy_host: 127.0.0.1
+  proxy_port: 3456
+  chrome_ports:
+  - 9222
+  - 9229
+  - 9333
+  auto_start_proxy: true
+  enable_port_guard: true
+  site_patterns: true

@@ -119,6 +119,26 @@ JS_EXTRACT_DETAIL = """
 })()
 """
 
+# JS: 检测详情页是否已存在"继续沟通"按钮（已有聊天记录，跳过采集）
+JS_CHECK_CONTINUE_CHAT = """
+(() => {
+    const selectors = [
+        'a[redirect-url*="/web/geek/chat"]',
+        'a.btn-startchat',
+        '[ka="job_detail_chat"]',
+        '[ka^="go_chat"]',
+        '[ka*="gochat"]',
+        '.op-btn-chat',
+        '.btn-startchat-wrap'
+    ];
+    const allEls = selectors.flatMap(s => Array.from(document.querySelectorAll(s)));
+    for (const el of allEls) {
+        const text = (el.innerText || el.textContent || '').trim();
+        if (text.includes('继续沟通')) return true;
+    }
+    return false;
+})()
+"""
 
 def _generate_job_id(url: str) -> str:
     """Generate a unique job ID from URL path."""
@@ -253,6 +273,12 @@ def scrape_jobs(config: dict, keywords: list[str], limit: int | None = None) -> 
 
                     time.sleep(2)
                     wait_for_load(detail_target, timeout=10)
+
+                    # 跳过已有"继续沟通"记录的岗位
+                    has_continue_chat = evaluate(detail_target, JS_CHECK_CONTINUE_CHAT)
+                    if has_continue_chat:
+                        close_tab(detail_target)
+                        continue
 
                     # Extract detail
                     detail_result = evaluate(detail_target, JS_EXTRACT_DETAIL)

@@ -20,10 +20,10 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_status, update_
 console = Console()
 
 # ─── 硬编码配置 ─────────────────────────────────────────────
-SCORE_MAX_WORKERS = 4
+SCORE_MAX_WORKERS = 6
 SCORE_RPM_LIMIT = 120
 AI_MAX_TOKENS = 800
-MAX_SCORE_RETRIES = 3
+MAX_SCORE_RETRIES = 5
 REASONING_EFFORT_EXCLUDE = ["kimi-k3", "sensenova-6.8-flash-lite"]
 
 # ─── Prompt 模板（保持不变）─────────────────────────────────

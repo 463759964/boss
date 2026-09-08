@@ -17,10 +17,10 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, updat
 console = Console()
 
 # ─── 模块内默认配置 ─────────────────────────────────────────────
-DEFAULT_MAX_WORKERS = 4
+DEFAULT_MAX_WORKERS = 6
 INITIAL_RPM_LIMIT = 30
 MIN_RPM_LIMIT = 5
-MAX_GENERATE_RETRIES = 4
+MAX_GENERATE_RETRIES = 5
 MAX_REVIEW_RETRIES = 3
 DEFAULT_GREETING = "过往经验很匹配"
 DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"

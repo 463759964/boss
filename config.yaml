@@ -44,27 +44,29 @@ search:
   max_pages: 4
 scoring:
   threshold: 45
+  max_candidates: 20
 throttle:
   daily_limit: 170
   interval_min: 30
   interval_max: 60
   browse_before_greet: true
-  browse_duration_min: 10
-  browse_duration_max: 30
+  browse_duration_min: 30
+  browse_duration_max: 60
   send_windows: []
   day_off_probability: 0.1
 ai:
   provider: openai_compatible
   service: custom
-  models:
-    - sensenova-6.8-flash-lite
-    - sensenova-u1-fast
-    - deepseek-v4-pro
-    - deepseek-v4-flash
-    - glm-5.2
-    - kimi-k3
+  model: claude-sonnet-4-6
   greeting_review_threshold: 7
   greeting_max_iterations: 2
+  models:
+  - sensenova-6.8-flash-lite
+  - sensenova-u1-fast
+  - deepseek-v4-pro
+  - deepseek-v4-flash
+  - glm-5.2
+  - kimi-k3
   base_url: https://token.sensenova.cn/v1
   api_key: sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
 monitor:

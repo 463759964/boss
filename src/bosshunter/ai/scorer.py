@@ -24,7 +24,7 @@ SCORE_MAX_WORKERS = 6
 SCORE_RPM_LIMIT = 120
 AI_MAX_TOKENS = 800
 MAX_SCORE_RETRIES = 5
-REASONING_EFFORT_EXCLUDE = ["kimi-k3", "sensenova-6.8-flash-lite"]
+REASONING_EFFORT_EXCLUDE = ["kimi-k3","sensenova-u1-fast"]
 
 # ─── Prompt 模板（保持不变）─────────────────────────────────
 SYSTEM_PROMPT = (

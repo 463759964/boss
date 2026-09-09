@@ -26,7 +26,7 @@ DEFAULT_GREETING = "过往经验很匹配"
 DEFAULT_CRITIQUE = "请确保语言自然、突出匹配优势、避免模板化开头"
 AI_MAX_GENERATE_TOKENS = 300
 AI_MAX_REVIEW_TOKENS = 120
-REASONING_EFFORT_EXCLUDE = ["kimi-k3", "sensenova-6.8-flash-lite"]
+REASONING_EFFORT_EXCLUDE = ["kimi-k3","sensenova-u1-fast"]
 
 
 # ─── Prompt 模板（保持不变）─────────────────────────────────────
@@ -345,45 +345,71 @@ def _review_greeting(greeting, job, config, model, attempt=1):
     return _parse_json_response(response)
 
 
-def _process_single_job(job, resume_summary, config, model) -> Tuple[Optional[str], str, Dict[str, Any]]:
-    """处理单个岗位，返回 (greeting, status_flag, meta)"""
+# 🆕 签名变更：接收完整模型列表而非单个模型
+def _process_single_job(job, resume_summary, config, models: List[str]) -> Tuple[Optional[str], str, Dict[str, Any]]:
+    """处理单个岗位，含模型切换兜底。返回 (greeting, status_flag, meta)"""
     max_iterations = int(config.get("ai", {}).get("greeting_max_iterations", 2) or 0)
     best_greeting = None
     used_fallback = False
-    meta = {"iterations": 0, "reviews": 0}
+    # 🆕 记录实际使用的模型
+    current_model = models[0] if models else "unknown"
+    meta = {"iterations": 0, "reviews": 0, "model": current_model}
 
     if not resume_summary:
         return DEFAULT_GREETING, "fallback", meta
 
-    for iteration in range(max_iterations + 1):
-        meta["iterations"] = iteration + 1
-        critique = ""
+    # 🆕 遍历所有可用模型，当前模型彻底失败后自动切换下一个
+    for model_idx, current_model in enumerate(models):
+        meta["model"] = current_model
+        job_success = False
 
-        if iteration > 0 and best_greeting:
-            meta["reviews"] += 1
+        for iteration in range(max_iterations + 1):
+            meta["iterations"] = iteration + 1
+            critique = ""
+
+            if iteration > 0 and best_greeting:
+                meta["reviews"] += 1
+                try:
+                    review = _review_with_retry(best_greeting, job, config, current_model)
+                except AIRequestError as exc:
+                    if exc.kind == "auth":
+                        raise
+                    review = None
+
+                if review and review.get("pass", False):
+                    job_success = True
+                    break
+                critique = review.get("critique", DEFAULT_CRITIQUE) if review else DEFAULT_CRITIQUE
+
             try:
-                review = _review_with_retry(best_greeting, job, config, model)
+                greeting = _generate_with_retry(job, resume_summary, config, current_model, critique)
             except AIRequestError as exc:
                 if exc.kind == "auth":
                     raise
-                review = None
+                greeting = None
 
-            if review and review.get("pass", False):
+            if not greeting:
+                # 🆕 当前模型生成彻底失败，跳出迭代循环尝试下一个模型
                 break
-            critique = review.get("critique", DEFAULT_CRITIQUE) if review else DEFAULT_CRITIQUE
 
-        try:
-            greeting = _generate_with_retry(job, resume_summary, config, model, critique)
-        except AIRequestError as exc:
-            if exc.kind == "auth":
-                raise
-            greeting = None
+            best_greeting = greeting
+            if max_iterations == 0:
+                job_success = True
+                break
 
-        if not greeting:
+        # 🆕 当前模型已成功产出结果，无需再切换
+        if job_success or best_greeting is not None:
             break
-        best_greeting = greeting
-        if max_iterations == 0:
-            break
+
+        # 🆕 当前模型失败且有备选模型，打印切换日志
+        if model_idx < len(models) - 1:
+            next_model = models[model_idx + 1]
+            tag = f"{job.get('company', '?')}｜{job.get('title', '?')}"
+            _log(f"生成失败，切换 {current_model} → {next_model} | {tag}", "yellow", "🔄")
+            # 重置状态，给新模型完整机会
+            best_greeting = None
+            meta["iterations"] = 0
+            meta["reviews"] = 0
 
     if not best_greeting:
         best_greeting = DEFAULT_GREETING
@@ -436,7 +462,8 @@ def generate_greetings(config: dict) -> int:
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(_process_single_job, job, resume_summary, config, models[i % len(models)]): job
+            # 🆕 传入完整模型列表，由 _process_single_job 内部决定起始模型与切换逻辑
+            executor.submit(_process_single_job, job, resume_summary, config, models): job
             for i, job in enumerate(jobs)
         }
 
@@ -450,6 +477,7 @@ def generate_greetings(config: dict) -> int:
                 greeting, flag, meta = future.result()
                 iters = meta.get("iterations", 1)
                 reviews = meta.get("reviews", 0)
+                mdl = meta.get("model", "?")  # 🆕 显示实际生效的模型
                 preview = (greeting or "").replace("\n", " ")[:50]
 
                 update_job_greeting(db, job["id"], greeting)
@@ -458,9 +486,9 @@ def generate_greetings(config: dict) -> int:
 
                 if flag == "fallback":
                     fallback_count += 1
-                    _log(f"⚠ 兜底 | {tag:<28} | I{iters}/R{reviews} | {preview}", "yellow")
+                    _log(f"⚠ 兜底 | {tag:<28} | {mdl} I{iters}/R{reviews} | {preview}", "yellow")
                 else:
-                    _log(f"✓ {tag:<28} | I{iters}/R{reviews} | {preview}", "green")
+                    _log(f"✓ {tag:<28} | {mdl} I{iters}/R{reviews} | {preview}", "green")
 
             except AIRequestError as exc:
                 if exc.kind == "auth":

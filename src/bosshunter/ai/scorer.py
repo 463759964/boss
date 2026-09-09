@@ -23,7 +23,7 @@ console = Console()
 SCORE_MAX_WORKERS = 6
 SCORE_RPM_LIMIT = 120
 AI_MAX_TOKENS = 800
-MAX_SCORE_RETRIES = 5
+MAX_SCORE_RETRIES = 4
 REASONING_EFFORT_EXCLUDE = ["kimi-k3","sensenova-u1-fast"]
 
 # ─── Prompt 模板（保持不变）─────────────────────────────────
@@ -216,32 +216,43 @@ def _call_ai(
 
 
 def _call_score_ai(messages, config, model, max_tokens, attempt=1):
-    """调用 AI 并解析 JSON（逻辑不变，省略以节省篇幅）"""
+    """调用 AI 并解析 JSON"""
     response = _call_ai(messages, config, model, max_tokens, attempt=attempt)
     if not response:
         return None
     cleaned = response.strip()
-    # ... [JSON 解析逻辑保持原样，此处省略] ...
-    # 为完整性保留下方解析代码
+
+    # 1. 去除 Markdown 代码块包裹
     if cleaned.startswith("```"):
         first_nl = cleaned.index("\n") if "\n" in cleaned else 3
         cleaned = cleaned[first_nl + 1:].rstrip("`").strip()
+
+    # 2. 尝试直接解析整个字符串
     try:
         result = json.loads(cleaned)
-        if isinstance(result, dict): return result
-    except (json.JSONDecodeError, TypeError): pass
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 3. 提取首个 {...} 子串进行解析
     start, end = cleaned.find("{"), cleaned.rfind("}") + 1
     if start >= 0 and end > start:
         try:
             result = json.loads(cleaned[start:end])
-            if isinstance(result, dict): return result
-        except (json.JSONDecodeError, TypeError): pass
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 4. 正则兜底：从非标准文本中提取 score 和 reason
     score_match = re.search(r'(?:score|分数|匹配度)[^\d]*(\d{1,3})', cleaned)
     reason_match = re.search(r'(?:reason|原因|总结)[：:]\s*(.{10,80})', cleaned)
     if score_match:
         raw_score = int(score_match.group(1))
         if 0 <= raw_score <= 100 and reason_match:
             return {"score": raw_score, "reason": reason_match.group(1).strip()}
+
     return None
 
 

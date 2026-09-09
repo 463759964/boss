@@ -3,6 +3,8 @@
 import json
 import time
 import threading
+import random
+import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple, List, Dict, Any
@@ -17,7 +19,7 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_greeting, updat
 console = Console()
 
 # ─── 模块内默认配置 ─────────────────────────────────────────────
-DEFAULT_MAX_WORKERS = 6
+DEFAULT_MAX_WORKERS = 4
 INITIAL_RPM_LIMIT = 30
 MIN_RPM_LIMIT = 5
 MAX_GENERATE_RETRIES = 5
@@ -124,6 +126,11 @@ class AdaptiveRateLimiter:
 _limiter = None
 
 
+def _get_key_fingerprint(api_key: str) -> str:
+    """获取 API Key 的安全指纹（SHA256前8位）"""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:8]
+
+
 def _get_resume_summary(config: dict) -> str:
     resume_path = Path(config.get("profile", {}).get("resume_path", "./resume.md"))
     if not resume_path.exists():
@@ -185,21 +192,32 @@ def _call_ai(
     max_tokens: int,
     attempt: int = 1,
     json_mode: bool = False,
-) -> str | None:
-    """调用 AI 接口，静默处理限流与重试"""
+) -> Tuple[Optional[str], str]:
+    """调用 AI 接口，静默处理限流与重试，支持多Key轮询，并返回(内容, Key指纹)"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
     if provider != "openai_compatible":
-        return None
+        return None, ""
 
     base_url = ai_cfg.get("base_url", "").rstrip("/")
-    api_key = ai_cfg.get("api_key", "")
+
+    # --- 支持从列表中随机选择一个 Key ---
+    api_key_cfg = ai_cfg.get("api_key", "")
+    if isinstance(api_key_cfg, list) and len(api_key_cfg) > 0:
+        api_key = random.choice(api_key_cfg)
+    else:
+        api_key = api_key_cfg
+    # --- 结束 ---
+
     if not base_url or not api_key:
         from bosshunter.ai.credentials import get_ai_base_url, get_ai_api_key
         base_url = get_ai_base_url(config) or ""
         api_key = get_ai_api_key(config) or ""
+        if isinstance(api_key, list) and len(api_key) > 0:
+             api_key = random.choice(api_key)
+
     if not base_url or not api_key:
-        return None
+        return None, ""
 
     url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -216,6 +234,8 @@ def _call_ai(
     global _limiter
     if _limiter:
         _limiter.wait()
+
+    key_fp = _get_key_fingerprint(api_key)
 
     for retry_429 in range(3):
         try:
@@ -235,12 +255,12 @@ def _call_ai(
             data = resp.json()
             choices = data.get("choices", [])
             if not choices:
-                return None
+                return None, key_fp
             finish_reason = choices[0].get("finish_reason")
             if finish_reason in ("content_filter", "length"):
-                return None
+                return None, key_fp
             content = choices[0].get("message", {}).get("content")
-            return content.strip() if content else None
+            return (content.strip() if content else None), key_fp
         except httpx.HTTPStatusError as exc:
             raise normalize_ai_error(exc) from exc
         except AIRequestError:
@@ -250,7 +270,7 @@ def _call_ai(
     raise AIRequestError("rate_limit", "429 retries exhausted")
 
 
-def _generate_greeting_once(job, resume_summary, config, model, critique="", *, compact=False, max_tokens=AI_MAX_GENERATE_TOKENS, attempt=1):
+def _generate_greeting_once(job, resume_summary, config, model, critique="", *, compact=False, max_tokens=AI_MAX_GENERATE_TOKENS, attempt=1) -> Tuple[Optional[str], str]:
     jd_limit = 250 if compact else 500
     resume_limit = 800 if compact else 1500
     jd_summary = _truncate_prompt_text(job.get("jd", ""), jd_limit) or "无详细描述"
@@ -274,17 +294,21 @@ def _generate_greeting_once(job, resume_summary, config, model, critique="", *, 
     if critique:
         messages.append({"role": "user", "content": f"上次生成的问题：{critique}，请避免此问题并重新生成。"})
 
-    greeting_raw = _call_ai(messages, config, model, max_tokens=max_tokens, attempt=attempt, json_mode=True)
+    result_tuple = _call_ai(messages, config, model, max_tokens=max_tokens, attempt=attempt, json_mode=True)
+    if not result_tuple:
+        return None, ""
+
+    greeting_raw, key_fp = result_tuple
     if not greeting_raw:
-        return None
+        return None, key_fp
 
     data = _parse_json_response(greeting_raw)
     if not data:
-        return None
+        return None, key_fp
 
     greeting = data.get("greeting", "").strip().strip('"\'')
     if not greeting:
-        return None
+        return None, key_fp
 
     # 超长截断
     if len(greeting) > 150:
@@ -297,16 +321,19 @@ def _generate_greeting_once(job, resume_summary, config, model, critique="", *, 
         else:
             greeting = cut
 
-    return greeting
+    return greeting, key_fp
 
 
-def _generate_with_retry(job, resume_summary, config, model, critique=""):
+def _generate_with_retry(job, resume_summary, config, model, critique="") -> Tuple[Optional[str], str]:
     last_error = None
+    last_key_fp = ""
     for attempt in range(1, MAX_GENERATE_RETRIES + 1):
         try:
-            result = _generate_greeting_once(job, resume_summary, config, model, critique, attempt=attempt)
+            result, key_fp = _generate_greeting_once(job, resume_summary, config, model, critique, attempt=attempt)
+            if key_fp:
+                last_key_fp = key_fp
             if result:
-                return result
+                return result, last_key_fp
             last_error = ValueError("AI returned empty")
         except AIRequestError as exc:
             last_error = exc
@@ -314,51 +341,56 @@ def _generate_with_retry(job, resume_summary, config, model, critique=""):
                 raise
             if exc.kind == "context_limit" and attempt < MAX_GENERATE_RETRIES:
                 try:
-                    result = _generate_greeting_once(job, resume_summary, config, model, critique, compact=True, max_tokens=160, attempt=attempt)
+                    result, key_fp = _generate_greeting_once(job, resume_summary, config, model, critique, compact=True, max_tokens=160, attempt=attempt)
+                    if key_fp:
+                        last_key_fp = key_fp
                     if result:
-                        return result
+                        return result, last_key_fp
                 except AIRequestError:
                     pass
         except Exception as exc:
             last_error = exc
-    return None
+    return None, last_key_fp
 
 
-def _review_with_retry(greeting, job, config, model):
+def _review_with_retry(greeting, job, config, model) -> Tuple[Optional[dict], str]:
+    last_key_fp = ""
     for attempt in range(1, MAX_REVIEW_RETRIES + 1):
         try:
-            result = _review_greeting(greeting, job, config, model, attempt=attempt)
+            result, key_fp = _review_greeting(greeting, job, config, model, attempt=attempt)
+            if key_fp:
+                last_key_fp = key_fp
             if result:
-                return result
+                return result, last_key_fp
         except AIRequestError as exc:
             if exc.kind in ("auth", "non_retryable"):
                 raise
         except Exception:
             pass
-    return None
+    return None, last_key_fp
 
 
-def _review_greeting(greeting, job, config, model, attempt=1):
+def _review_greeting(greeting, job, config, model, attempt=1) -> Tuple[Optional[dict], str]:
     prompt = REVIEW_PROMPT.format(title=job["title"], company=job["company"], greeting=greeting)
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-    response = _call_ai(messages, config, model, max_tokens=AI_MAX_REVIEW_TOKENS, attempt=attempt, json_mode=True)
-    return _parse_json_response(response)
+    result_tuple = _call_ai(messages, config, model, max_tokens=AI_MAX_REVIEW_TOKENS, attempt=attempt, json_mode=True)
+    if not result_tuple:
+        return None, ""
+    response, key_fp = result_tuple
+    return _parse_json_response(response), key_fp
 
 
-# 🆕 签名变更：接收完整模型列表而非单个模型
 def _process_single_job(job, resume_summary, config, models: List[str]) -> Tuple[Optional[str], str, Dict[str, Any]]:
     """处理单个岗位，含模型切换兜底。返回 (greeting, status_flag, meta)"""
     max_iterations = int(config.get("ai", {}).get("greeting_max_iterations", 2) or 0)
     best_greeting = None
     used_fallback = False
-    # 🆕 记录实际使用的模型
     current_model = models[0] if models else "unknown"
-    meta = {"iterations": 0, "reviews": 0, "model": current_model}
+    meta = {"iterations": 0, "reviews": 0, "model": current_model, "key": "?"}
 
     if not resume_summary:
         return DEFAULT_GREETING, "fallback", meta
 
-    # 🆕 遍历所有可用模型，当前模型彻底失败后自动切换下一个
     for model_idx, current_model in enumerate(models):
         meta["model"] = current_model
         job_success = False
@@ -370,7 +402,9 @@ def _process_single_job(job, resume_summary, config, models: List[str]) -> Tuple
             if iteration > 0 and best_greeting:
                 meta["reviews"] += 1
                 try:
-                    review = _review_with_retry(best_greeting, job, config, current_model)
+                    review, review_key_fp = _review_with_retry(best_greeting, job, config, current_model)
+                    if review_key_fp:
+                        meta["key"] = review_key_fp
                 except AIRequestError as exc:
                     if exc.kind == "auth":
                         raise
@@ -382,14 +416,15 @@ def _process_single_job(job, resume_summary, config, models: List[str]) -> Tuple
                 critique = review.get("critique", DEFAULT_CRITIQUE) if review else DEFAULT_CRITIQUE
 
             try:
-                greeting = _generate_with_retry(job, resume_summary, config, current_model, critique)
+                greeting, gen_key_fp = _generate_with_retry(job, resume_summary, config, current_model, critique)
+                if gen_key_fp:
+                    meta["key"] = gen_key_fp
             except AIRequestError as exc:
                 if exc.kind == "auth":
                     raise
                 greeting = None
 
             if not greeting:
-                # 🆕 当前模型生成彻底失败，跳出迭代循环尝试下一个模型
                 break
 
             best_greeting = greeting
@@ -397,16 +432,13 @@ def _process_single_job(job, resume_summary, config, models: List[str]) -> Tuple
                 job_success = True
                 break
 
-        # 🆕 当前模型已成功产出结果，无需再切换
         if job_success or best_greeting is not None:
             break
 
-        # 🆕 当前模型失败且有备选模型，打印切换日志
         if model_idx < len(models) - 1:
             next_model = models[model_idx + 1]
             tag = f"{job.get('company', '?')}｜{job.get('title', '?')}"
             _log(f"生成失败，切换 {current_model} → {next_model} | {tag}", "yellow", "🔄")
-            # 重置状态，给新模型完整机会
             best_greeting = None
             meta["iterations"] = 0
             meta["reviews"] = 0
@@ -451,6 +483,16 @@ def generate_greetings(config: dict) -> int:
     global _limiter
     _limiter = AdaptiveRateLimiter(initial_rpm=initial_rpm, min_rpm=min_rpm)
 
+    # --- 启动时打印加载的 Key 数量和指纹 ---
+    ai_cfg = config.get("ai", {})
+    api_key_cfg = ai_cfg.get("api_key", "")
+    if isinstance(api_key_cfg, list) and len(api_key_cfg) > 0:
+        key_fingerprints = [_get_key_fingerprint(k) for k in api_key_cfg]
+        _log(f"🔑 已加载 {len(api_key_cfg)} 个 API Key: {', '.join(key_fingerprints)}", "cyan")
+    elif isinstance(api_key_cfg, str) and api_key_cfg:
+        _log(f"🔑 已加载 1 个 API Key: {_get_key_fingerprint(api_key_cfg)}", "cyan")
+    # ----------------------------------------------
+
     # ▶ 启动摘要
     _log(f"招呼语生成 | 岗位={len(jobs)} 模型={len(models)} 并发={max_workers} RPM={initial_rpm}", "cyan", "🚀")
 
@@ -462,7 +504,6 @@ def generate_greetings(config: dict) -> int:
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            # 🆕 传入完整模型列表，由 _process_single_job 内部决定起始模型与切换逻辑
             executor.submit(_process_single_job, job, resume_summary, config, models): job
             for i, job in enumerate(jobs)
         }
@@ -477,7 +518,8 @@ def generate_greetings(config: dict) -> int:
                 greeting, flag, meta = future.result()
                 iters = meta.get("iterations", 1)
                 reviews = meta.get("reviews", 0)
-                mdl = meta.get("model", "?")  # 🆕 显示实际生效的模型
+                mdl = meta.get("model", "?")
+                key_info = meta.get("key", "?")
                 preview = (greeting or "").replace("\n", " ")[:50]
 
                 update_job_greeting(db, job["id"], greeting)
@@ -486,9 +528,9 @@ def generate_greetings(config: dict) -> int:
 
                 if flag == "fallback":
                     fallback_count += 1
-                    _log(f"⚠ 兜底 | {tag:<28} | {mdl} I{iters}/R{reviews} | {preview}", "yellow")
+                    _log(f"⚠ 兜底 | {tag:<28} | {mdl} | {key_info} | I{iters}/R{reviews} | {preview}", "yellow")
                 else:
-                    _log(f"✓ {tag:<28} | {mdl} I{iters}/R{reviews} | {preview}", "green")
+                    _log(f"✓ {tag:<28} | {mdl} | {key_info} | I{iters}/R{reviews} | {preview}", "green")
 
             except AIRequestError as exc:
                 if exc.kind == "auth":

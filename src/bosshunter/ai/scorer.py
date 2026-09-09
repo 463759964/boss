@@ -1,9 +1,9 @@
 """Score module - AI-powered job-resume matching with multi-model concurrency."""
-
 import json
 import re
 import time
 import threading
+import random  # 导入 random 模块
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,10 +20,10 @@ from bosshunter.db import get_db, get_jobs_by_status, update_job_status, update_
 console = Console()
 
 # ─── 硬编码配置 ─────────────────────────────────────────────
-SCORE_MAX_WORKERS = 6
+SCORE_MAX_WORKERS = 3
 SCORE_RPM_LIMIT = 120
 AI_MAX_TOKENS = 800
-MAX_SCORE_RETRIES = 4
+MAX_SCORE_RETRIES = 3
 REASONING_EFFORT_EXCLUDE = ["kimi-k3","sensenova-u1-fast"]
 
 # ─── Prompt 模板（保持不变）─────────────────────────────────
@@ -37,28 +37,22 @@ SYSTEM_PROMPT = (
     "使用'X届，已毕业Y年'格式，严禁对非当年毕业生使用'应届生'标签"
 )
 
-USER_PROMPT_TEMPLATE = """## 当前时间
-{current_date}
-
+USER_PROMPT_TEMPLATE = """## 当前时间 {current_date}
 ## 简历摘要
 {resume_summary}
-
 ## 岗位信息
 - 职位：{title}
 - 公司：{company}
 - 薪资：{salary}
 - 岗位描述：{jd}
-
 ## 评分维度
 1. 技术栈匹配度（25%）
 2. 经验年限匹配（10%）
 3. 业务领域相关性（40%）
 4. 薪资匹配度（15%）
 5. 发展空间（10%）
-
 ⚠ 重要：当前是{current_year}年，若候选人毕业于{current_year}年之前，
 禁止使用"应届生"标签，应根据实际毕业年份描述（如"25届，已毕业1年"）。
-
 请根据上述信息评估匹配程度。"""
 
 RE_EVAL_PROMPT_TEMPLATE = """## 二次独立评估请求
@@ -68,19 +62,15 @@ RE_EVAL_PROMPT_TEMPLATE = """## 二次独立评估请求
 - 职位：{title} @ {company}
 - 简历关键匹配点：{resume_snippet}
 - JD核心要求：{jd_snippet}
-
 ⚠ 重申：当前是{current_year}年，请基于此时间判断候选人毕业时长，
 严禁对非当年毕业生使用"应届生"标签。
-
 请重新给出你的独立判断。"""
-
 
 # ─── 日志工具 ───────────────────────────────────────────────
 def _log(msg: str, style: str = "", icon: str = ""):
     """统一日志输出，保持界面整洁"""
     prefix = f"{icon} " if icon else ""
     console.print(f"{prefix}{msg}", style=style, highlight=False)
-
 
 class AdaptiveRateLimiter:
     """线程安全的滑动窗口限流器（静默自适应）"""
@@ -113,9 +103,7 @@ class AdaptiveRateLimiter:
             if new_limit != self.max_requests:
                 self.max_requests = new_limit
 
-
 _limiter = None
-
 
 def _get_resume_summary(config: dict) -> str:
     resume_path = Path(config.get("profile", {}).get("resume_path", "./resume.md"))
@@ -135,7 +123,6 @@ def _get_resume_summary(config: dict) -> str:
         summary += "\n" + remaining[:2000 - len(summary)]
     return summary[:2000]
 
-
 def _get_models(config: dict) -> List[str]:
     ai_cfg = config.get("ai", {})
     models = ai_cfg.get("models")
@@ -146,35 +133,49 @@ def _get_models(config: dict) -> List[str]:
         return [single]
     return []
 
-
 def _call_ai(
     messages: List[Dict[str, str]],
     config: dict,
     model: str,
     max_tokens: int,
     attempt: int = 1,
-) -> Optional[str]:
-    """调用 AI 接口，静默处理限流与重试"""
+) -> Optional[Tuple[str, str]]:
+    """调用 AI 接口，静默处理限流与重试，支持多Key轮询，并返回(内容, Key指纹)"""
     ai_cfg = config.get("ai", {})
     provider = ai_cfg.get("provider", "openai_compatible")
     if provider != "openai_compatible":
         return None
 
     base_url = ai_cfg.get("base_url", "").rstrip("/")
-    api_key = ai_cfg.get("api_key", "")
+
+    # --- 支持从列表中随机选择一个 Key ---
+    api_key_cfg = ai_cfg.get("api_key", "")
+    if isinstance(api_key_cfg, list) and len(api_key_cfg) > 0:
+        api_key = random.choice(api_key_cfg)
+    else:
+        api_key = api_key_cfg
+    # --- 结束 ---
+
     if not base_url or not api_key:
         from bosshunter.ai.credentials import get_ai_base_url, get_ai_api_key
         base_url = get_ai_base_url(config) or ""
         api_key = get_ai_api_key(config) or ""
+        if isinstance(api_key, list) and len(api_key) > 0:
+             api_key = random.choice(api_key)
+
     if not base_url or not api_key:
         return None
 
     url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
     temperature = 1.0 if model == "kimi-k3" else 0.1
     payload = {
-        "model": model, "messages": messages, "max_tokens": max_tokens,
-        "temperature": temperature, "response_format": {"type": "json_object"},
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
     }
     if model not in REASONING_EFFORT_EXCLUDE:
         payload["reasoning_effort"] = "none"
@@ -187,7 +188,8 @@ def _call_ai(
         try:
             resp = httpx.post(url, headers=headers, json=payload, timeout=60)
             if resp.status_code == 429:
-                if _limiter: _limiter.decrease_limit()
+                if _limiter:
+                    _limiter.decrease_limit()
                 wait_time = min(float(resp.headers.get("Retry-After", 2)), 5.0)
                 time.sleep(wait_time)
                 continue
@@ -205,7 +207,11 @@ def _call_ai(
             if finish_reason in ("content_filter", "length"):
                 return None
             content = choices[0].get("message", {}).get("content")
-            return content.strip() if content else None
+
+            # 返回内容和 Key 指纹（前8位）
+            key_fingerprint = api_key[:8] + "..."
+            return (content.strip() if content else None), key_fingerprint
+
         except httpx.HTTPStatusError as exc:
             raise normalize_ai_error(exc) from exc
         except AIRequestError:
@@ -214,14 +220,17 @@ def _call_ai(
             raise AIRequestError("network", str(exc)) from exc
     raise AIRequestError("rate_limit", "429 retries exhausted")
 
-
 def _call_score_ai(messages, config, model, max_tokens, attempt=1):
     """调用 AI 并解析 JSON"""
-    response = _call_ai(messages, config, model, max_tokens, attempt=attempt)
+    response_tuple = _call_ai(messages, config, model, max_tokens, attempt=attempt)
+    if not response_tuple:
+        return None
+
+    response, key_fp = response_tuple  # 解包获取内容和Key指纹
     if not response:
         return None
-    cleaned = response.strip()
 
+    cleaned = response.strip()
     # 1. 去除 Markdown 代码块包裹
     if cleaned.startswith("```"):
         first_nl = cleaned.index("\n") if "\n" in cleaned else 3
@@ -231,7 +240,7 @@ def _call_score_ai(messages, config, model, max_tokens, attempt=1):
     try:
         result = json.loads(cleaned)
         if isinstance(result, dict):
-            return result
+            return result, key_fp  # 返回解析结果和Key指纹
     except (json.JSONDecodeError, TypeError):
         pass
 
@@ -241,7 +250,7 @@ def _call_score_ai(messages, config, model, max_tokens, attempt=1):
         try:
             result = json.loads(cleaned[start:end])
             if isinstance(result, dict):
-                return result
+                return result, key_fp
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -251,10 +260,8 @@ def _call_score_ai(messages, config, model, max_tokens, attempt=1):
     if score_match:
         raw_score = int(score_match.group(1))
         if 0 <= raw_score <= 100 and reason_match:
-            return {"score": raw_score, "reason": reason_match.group(1).strip()}
-
+            return {"score": raw_score, "reason": reason_match.group(1).strip()}, key_fp
     return None
-
 
 def _score_single_job(job, resume_summary, config, model, max_tokens):
     """单岗位评分（逻辑不变）"""
@@ -265,53 +272,67 @@ def _score_single_job(job, resume_summary, config, model, max_tokens):
     max_retries = int(config.get("scoring", {}).get("max_retries", MAX_SCORE_RETRIES))
 
     best_score, best_reason, last_error_kind = None, "", None
-    meta = {"total_attempts": 0, "rounds_used": 0, "model": model}
+    meta = {"total_attempts": 0, "rounds_used": 0, "model": model, "key": "?"}
 
     for eval_round in range(1, 3):
         meta["rounds_used"] = eval_round
         if eval_round == 2:
             user_prompt = RE_EVAL_PROMPT_TEMPLATE.format(
-                current_date=current_date, current_year=current_year,
-                first_score=best_score, first_reason=best_reason,
-                title=job["title"], company=job["company"],
-                resume_snippet=resume_summary[:300], jd_snippet=(job.get("jd") or "")[:300]
+                current_date=current_date,
+                current_year=current_year,
+                first_score=best_score,
+                first_reason=best_reason,
+                title=job["title"],
+                company=job["company"],
+                resume_snippet=resume_summary[:300],
+                jd_snippet=(job.get("jd") or "")[:300]
             )
             time.sleep(2)
         else:
             user_prompt = USER_PROMPT_TEMPLATE.format(
-                current_date=current_date, current_year=current_year,
-                resume_summary=resume_summary, title=job["title"],
-                company=job["company"], salary=job.get("salary") or "面议",
+                current_date=current_date,
+                current_year=current_year,
+                resume_summary=resume_summary,
+                title=job["title"],
+                company=job["company"],
+                salary=job.get("salary") or "面议",
                 jd=(job.get("jd") or "")[:800],
             )
+
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}]
         last_error_kind = None
 
         for attempt in range(1, max_retries + 1):
             meta["total_attempts"] += 1
             try:
-                result = _call_score_ai(messages, config, model, max_tokens, attempt=attempt)
-                if result is not None:
-                    score = max(0, min(100, int(result["score"])))
-                    reason = str(result.get("reason", ""))[:200]
+                result_tuple = _call_score_ai(messages, config, model, max_tokens, attempt=attempt)
+                if result_tuple is not None:
+                    parsed_result, key_fp = result_tuple
+                    meta["key"] = key_fp  # 存入 meta 供日志使用
+
+                    score = max(0, min(100, int(parsed_result["score"])))
+                    reason = str(parsed_result.get("reason", ""))[:200]
                     if best_score is None or score > best_score:
                         best_score, best_reason = score, reason
                     if score >= threshold:
                         return score, reason, None, meta
-                    if eval_round == 1: break
-                    else: return best_score, best_reason, None, meta
+                    if eval_round == 1:
+                        break
+                    else:
+                        return best_score, best_reason, None, meta
                 else:
                     last_error_kind = "parse_error"
             except AIRequestError as exc:
                 last_error_kind = exc.kind
-                if exc.kind == "auth": return None, None, "auth", meta
+                if exc.kind == "auth":
+                    return None, None, "auth", meta
             except Exception:
                 last_error_kind = "unknown"
 
-        if eval_round == 1 and best_score is None: break
+        if eval_round == 1 and best_score is None:
+            break
 
     return best_score, best_reason, last_error_kind, meta
-
 
 def score_jobs(config: dict) -> Tuple[int, int]:
     db = get_db()
@@ -335,6 +356,14 @@ def score_jobs(config: dict) -> Tuple[int, int]:
 
     global _limiter
     _limiter = AdaptiveRateLimiter(initial_rpm=SCORE_RPM_LIMIT, min_rpm=5)
+
+    # --- 启动时打印加载的 Key 数量和指纹 ---
+    ai_cfg = config.get("ai", {})
+    api_key_cfg = ai_cfg.get("api_key", "")
+    if isinstance(api_key_cfg, list):
+        key_fingerprints = [f"{k[:8]}..." for k in api_key_cfg]
+        _log(f"🔑 已加载 {len(api_key_cfg)} 个 API Key: {', '.join(key_fingerprints)}", "cyan")
+    # ----------------------------------------------
 
     # ▶ 启动摘要（仅一行）
     _log(f"评分启动 | 岗位={len(jobs)} 模型={len(models)} 并发={max_workers} RPM={SCORE_RPM_LIMIT} 阈值={threshold}", "cyan", "🚀")
@@ -365,26 +394,25 @@ def score_jobs(config: dict) -> Tuple[int, int]:
             executor.submit(_score_single_job, job, resume_summary, config, models[i % len(models)], AI_MAX_TOKENS): job
             for i, job in enumerate(jobs_to_score)
         }
-
         done_count = 0
         for future in as_completed(future_map):
             job = future_map[future]
             done_count += 1
             status.update(f"[bold green]评分中 {done_count}/{total}")
             tag = f"{job['company']}｜{job['title']}"
-
             try:
                 score, reason, err, meta = future.result()
                 mdl = meta.get("model", "?")
+                key_info = meta.get("key", "?")  # 获取Key指纹
                 att = meta.get("total_attempts", 0)
                 rnd = meta.get("rounds_used", 1)
-
                 if score is None:
                     if err == "auth":
                         status.stop()
                         _log(f"认证失败，终止评分 | {tag} | {mdl}", "red bold", "🛑")
                         for f in future_map:
-                            if not f.done(): f.cancel()
+                            if not f.done():
+                                f.cancel()
                         break
                     skipped += 1
                     _log(f"跳过 | {tag} | {err or 'UNKNOWN'} | T{att}", "yellow", "⏭")
@@ -393,11 +421,10 @@ def score_jobs(config: dict) -> Tuple[int, int]:
                 update_job_score(db, job["id"], score, reason)
                 if score >= threshold:
                     update_job_status(db, job["id"], "approved"); approved += 1
-                    _log(f"{score:>3} ✓ | {tag:<28} | {mdl} R{rnd}/T{att} | {(reason or '')[:35]}", "green")
+                    _log(f"{score:>3} ✓ | {tag:<28} | {mdl} | {key_info} | R{rnd}/T{att} | {(reason or '')[:35]}", "green")
                 else:
                     update_job_status(db, job["id"], "filtered"); filtered += 1
-                    _log(f"{score:>3} ✗ | {tag:<28} | {mdl} R{rnd}/T{att} | {(reason or '')[:35]}", "dim")
-
+                    _log(f"{score:>3} ✗ | {tag:<28} | {mdl} | {key_info} | R{rnd}/T{att} | {(reason or '')[:35]}", "dim")
             except Exception as exc:
                 skipped += 1
                 _log(f"异常 | {tag} | {exc}", "red", "💥")
@@ -407,7 +434,6 @@ def score_jobs(config: dict) -> Tuple[int, int]:
 
     # ▶ 完成摘要
     _log(f"完成 | ✓{approved} ✗{filtered}(预筛{pre_filtered}) ⏭{skipped}", "green bold", "📊")
-
     if approved > 0:
         _log("自动衔接后续流程...", "cyan", "→")
         try:

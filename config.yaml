@@ -11,7 +11,8 @@ profile:
   - 深圳
   - 广州
   - 苏州
-  salary_min: 11
+  - 成都
+  salary_min: 10
   salary_max: 17
   allow_internship: false
   deal_breakers:
@@ -26,6 +27,7 @@ profile:
   - 银行
   - 主管
   - 兼职
+  - 专家
 search:
   keywords:
   - 座舱
@@ -41,19 +43,20 @@ search:
   - 深圳
   - 广州
   - 苏州
-  max_pages: 4
+  - 成都
+  max_pages: 5
 scoring:
   threshold: 45
   max_candidates: 20
 throttle:
   daily_limit: 170
-  interval_min: 30
-  interval_max: 60
+  interval_min: 40
+  interval_max: 90
   browse_before_greet: true
-  browse_duration_min: 30
+  browse_duration_min: 40
   browse_duration_max: 60
   send_windows: []
-  day_off_probability: 0.1
+  day_off_probability: 0.05
 ai:
   provider: openai_compatible
   service: custom
@@ -62,13 +65,14 @@ ai:
   greeting_max_iterations: 2
   models:
   - sensenova-6.8-flash-lite
-  - sensenova-u1-fast
   - deepseek-v4-pro
   - deepseek-v4-flash
   - glm-5.2
   - kimi-k3
   base_url: https://token.sensenova.cn/v1
-  api_key: sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
+  api_key:
+  - sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
+  - sk-pbQ7BMLEtyva8dI8X2gY6rMCrmOAVfPe
 monitor:
   interval: 30
   chat_url: https://www.zhipin.com/web/geek/chat

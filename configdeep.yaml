@@ -1,53 +1,88 @@
 profile:
-  resume_path: C:\Users\46375\Documents\BossHunter\data\resumes\test.md
+  resume_path: C:\Users\46375\Documents\BossHunter\data\resumes\座舱测试.md
   resume_output_dir: ./data/resumes
   target_cities:
   - 大连
+  - 上海
+  - 南京
+  - 合肥
+  - 武汉
+  - 杭州
+  - 深圳
+  - 广州
+  - 苏州
+  - 成都
   salary_min: 11
-  salary_max: 16
+  salary_max: 17
   allow_internship: false
   deal_breakers:
   - 虹软
   - 游戏
   - 药
   - 服装
+  - 生产
+  - 销售
+  - 化妆
+  - 开发
+  - 银行
+  - 主管
+  - 兼职
+  - 专家
 search:
   keywords:
   - 座舱
-  - 质量
   - 车载
+  - 质量
   cities:
   - 大连
-  max_pages: 2
+  - 上海
+  - 南京
+  - 合肥
+  - 武汉
+  - 杭州
+  - 深圳
+  - 广州
+  - 苏州
+  - 成都
+  max_pages: 5
 scoring:
-  threshold: 40
+  threshold: 45
   max_candidates: 20
 throttle:
-  daily_limit: 40
-  interval_min: 30
-  interval_max: 180
+  daily_limit: 350
+  interval_min: 60
+  interval_max: 100
   browse_before_greet: true
-  browse_duration_min: 15
-  browse_duration_max: 30
+  browse_duration_min: 40
+  browse_duration_max: 100
   send_windows: []
-  day_off_probability: 0.05
+  day_off_probability: 0.1
 ai:
   provider: openai_compatible
   service: custom
   model: deepseek-v4-flash
   greeting_review_threshold: 7
   greeting_max_iterations: 2
+  models:
+  - sensenova-6.8-flash-lite
+  - deepseek-v4-pro
+  - deepseek-v4-flash
+  - glm-5.2
+  - kimi-k3
   base_url: https://token.sensenova.cn/v1
-  api_key:  sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
+  api_keys:
+  - sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
+  - sk-pbQ7BMLEtyva8dI8X2gY6rMCrmOAVfPe
+  api_key: sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
 monitor:
   interval: 30
   chat_url: https://www.zhipin.com/web/geek/chat
-  max_resume_sends_per_cycle: 15
+  max_resume_sends_per_cycle: 20
   auto_reply_hr_questions: false
 follow_up:
   enabled: false
   interval_hours: 40
-  skip_weekends: true
+  skip_weekends: false
 dedup:
   history_file: ./data/history.jsonl
 browser:

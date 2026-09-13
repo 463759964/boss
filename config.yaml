@@ -12,7 +12,7 @@ profile:
   - 广州
   - 苏州
   - 成都
-  salary_min: 10
+  salary_min: 11
   salary_max: 17
   allow_internship: false
   deal_breakers:
@@ -49,18 +49,18 @@ scoring:
   threshold: 45
   max_candidates: 20
 throttle:
-  daily_limit: 170
-  interval_min: 40
-  interval_max: 90
+  daily_limit: 150
+  interval_min: 60
+  interval_max: 100
   browse_before_greet: true
   browse_duration_min: 40
-  browse_duration_max: 60
+  browse_duration_max: 100
   send_windows: []
-  day_off_probability: 0.05
+  day_off_probability: 0.1
 ai:
   provider: openai_compatible
   service: custom
-  model: claude-sonnet-4-6
+  model: deepseek-v4-flash
   greeting_review_threshold: 7
   greeting_max_iterations: 2
   models:
@@ -70,9 +70,10 @@ ai:
   - glm-5.2
   - kimi-k3
   base_url: https://token.sensenova.cn/v1
-  api_key:
+  api_keys:
   - sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
   - sk-pbQ7BMLEtyva8dI8X2gY6rMCrmOAVfPe
+  api_key: sk-pcn6lz9VTuWFJ9UeOIZvAPBr2bIItpqE
 monitor:
   interval: 30
   chat_url: https://www.zhipin.com/web/geek/chat

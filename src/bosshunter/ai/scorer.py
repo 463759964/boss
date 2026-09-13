@@ -149,25 +149,25 @@ def _call_ai(
     base_url = ai_cfg.get("base_url", "").rstrip("/")
 
     # --- 支持从列表中随机选择一个 Key ---
-    api_key_cfg = ai_cfg.get("api_key", "")
-    if isinstance(api_key_cfg, list) and len(api_key_cfg) > 0:
-        api_key = random.choice(api_key_cfg)
+    api_keys_cfg = ai_cfg.get("api_keys", "")
+    if isinstance(api_keys_cfg, list) and len(api_keys_cfg) > 0:
+        api_keys = random.choice(api_keys_cfg)
     else:
-        api_key = api_key_cfg
+        api_keys = api_keys_cfg
     # --- 结束 ---
 
-    if not base_url or not api_key:
-        from bosshunter.ai.credentials import get_ai_base_url, get_ai_api_key
+    if not base_url or not api_keys:
+        from bosshunter.ai.credentials import get_ai_base_url, get_ai_api_keys
         base_url = get_ai_base_url(config) or ""
-        api_key = get_ai_api_key(config) or ""
-        if isinstance(api_key, list) and len(api_key) > 0:
-             api_key = random.choice(api_key)
+        api_keys = get_ai_api_keys(config) or ""
+        if isinstance(api_keys, list) and len(api_keys) > 0:
+             api_keys = random.choice(api_keys)
 
-    if not base_url or not api_key:
+    if not base_url or not api_keys:
         return None
 
     url = f"{base_url}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {api_keys}", "Content-Type": "application/json"}
 
     temperature = 1.0 if model == "kimi-k3" else 0.1
     payload = {
@@ -209,7 +209,7 @@ def _call_ai(
             content = choices[0].get("message", {}).get("content")
 
             # 返回内容和 Key 指纹（前8位）
-            key_fingerprint = api_key[:8] + "..."
+            key_fingerprint = api_keys[:8] + "..."
             return (content.strip() if content else None), key_fingerprint
 
         except httpx.HTTPStatusError as exc:
@@ -359,10 +359,10 @@ def score_jobs(config: dict) -> Tuple[int, int]:
 
     # --- 启动时打印加载的 Key 数量和指纹 ---
     ai_cfg = config.get("ai", {})
-    api_key_cfg = ai_cfg.get("api_key", "")
-    if isinstance(api_key_cfg, list):
-        key_fingerprints = [f"{k[:8]}..." for k in api_key_cfg]
-        _log(f"🔑 已加载 {len(api_key_cfg)} 个 API Key: {', '.join(key_fingerprints)}", "cyan")
+    api_keys_cfg = ai_cfg.get("api_keys", "")
+    if isinstance(api_keys_cfg, list):
+        key_fingerprints = [f"{k[:8]}..." for k in api_keys_cfg]
+        _log(f"🔑 已加载 {len(api_keys_cfg)} 个 API Key: {', '.join(key_fingerprints)}", "cyan")
     # ----------------------------------------------
 
     # ▶ 启动摘要（仅一行）

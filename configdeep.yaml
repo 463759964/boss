@@ -49,7 +49,7 @@ scoring:
   threshold: 45
   max_candidates: 20
 throttle:
-  daily_limit: 350
+  daily_limit: 150
   interval_min: 60
   interval_max: 100
   browse_before_greet: true
